@@ -15,7 +15,7 @@ from test_pdf_report_workspace import excel
 
 
 class RequestedReportUpdatesTests(unittest.TestCase):
-    def test_portal_arrival_sets_today_without_changing_capture_countdowns(self):
+    def test_portal_capture_date_preserves_saved_deadlines_and_countdowns(self):
         rows = [
             {'Order Number': 'latest', 'Arrival Time': '10/22/2026 10:47 PM', 'Task Status': 'Available',
              'SLA Expiration*': '2026-10-22T23:59:00-07:00'},
@@ -36,7 +36,8 @@ class RequestedReportUpdatesTests(unittest.TestCase):
         actual = {row['Order Number']: row for row in report['rows']}
         self.assertEqual(actual['latest']['SLA Category'], 'Today SLA')
         self.assertEqual(actual['older']['SLA Category'], 'Negative SLA')
-        self.assertEqual(actual['countdown']['SLA Expiration'], '2026-10-23 03:30:00')
+        self.assertEqual(actual['countdown']['SLA Expiration'], '2026-10-22 17:00:00')
+        self.assertEqual(actual['countdown']['SLA Category'], 'Today SLA')
         self.assertEqual(rows, original)
 
     def test_removed_abs_status_merges_automatic_saved_and_custom_groups(self):

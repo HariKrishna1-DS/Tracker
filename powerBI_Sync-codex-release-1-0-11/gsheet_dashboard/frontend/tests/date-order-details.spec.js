@@ -174,7 +174,7 @@ test('monthly capacity opens daily dates and editable orders inside the same pop
   await dialog.getByRole('button',{name:`Edit order ${fixture.rows[5]['Order Number']}`,exact:true}).click();
   await dialog.getByLabel('Edit Client',{exact:true}).fill('Monthly correction');
   await dialog.getByRole('button',{name:'Save order changes',exact:true}).click();
-  await expect(dialog.getByRole('status')).toContainText('saved');
+  await expect(dialog.getByRole('status').filter({hasText:'saved'})).toContainText('saved');
   await expect(dialog.getByRole('button',{name:'30-09-26',exact:true})).toHaveAttribute('aria-pressed','true');
   expect(writes[0]).toMatchObject({report_date:'2026-09-30',changes:{Client:'Monthly correction'}});
   await page.screenshot({path:'test-results/capacity-month-drilldown.png',fullPage:true});
@@ -197,7 +197,7 @@ test('same order number from different workbooks stays separate and edits the se
   await expect(dialog.getByLabel('Edit Source workbook',{exact:true})).toHaveCount(0);
   await dialog.getByLabel('Edit Client',{exact:true}).fill('Selected workbook client');
   await dialog.getByRole('button',{name:'Save order changes',exact:true}).click();
-  await expect(dialog.getByRole('status')).toContainText('saved');
+  await expect(dialog.getByRole('status').filter({hasText:'saved'})).toContainText('saved');
   expect(writes[0].source_workbook).toBe('other.xlsx');
   expect(fixture.rows[0].Client).toBe(firstClient);
   expect(fixture.rows[1].Client).toBe('Selected workbook client');
@@ -216,7 +216,7 @@ test('repeated order numbers in one workbook remain visible and edit only the se
   await expect(dialog.getByLabel('Edit Source row ID',{exact:true})).toHaveCount(0);
   await dialog.getByLabel('Edit Client',{exact:true}).fill('Selected occurrence client');
   await dialog.getByRole('button',{name:'Save order changes',exact:true}).click();
-  await expect(dialog.getByRole('status')).toContainText('saved');
+  await expect(dialog.getByRole('status').filter({hasText:'saved'})).toContainText('saved');
   expect(writes[0].record_key).toBe(fixture.rows[1]._record_key);
   expect(fixture.rows[0]).toEqual(original);
   expect(fixture.rows[1].Client).toBe('Selected occurrence client');
@@ -233,7 +233,7 @@ test('capacity orders can edit status and completion date and show recorded fiel
   await dialog.getByLabel('Edit Status',{exact:true}).fill('Completed and Delivered');
   await dialog.getByLabel('Edit Out Time',{exact:true}).fill('10/03/2026 01:00 PM');
   await dialog.getByRole('button',{name:'Save order changes',exact:true}).click();
-  await expect(dialog.getByRole('status')).toContainText('saved. Google Sheets reports are updating');
+  await expect(dialog.getByRole('status').filter({hasText:'saved'})).toContainText('saved. Google Sheets reports are updating');
   await dialog.getByRole('button',{name:'Recorded changes 2',exact:true}).click();
   await expect(dialog.locator('tbody tr')).toHaveCount(2);
   await expect(dialog.getByRole('cell',{name:'10/03/2026 01:00 PM',exact:true}).first()).toBeVisible();
@@ -284,7 +284,9 @@ test('report cards and tables have clear typography and states in light, dark an
   expect(await metrics.evaluate(element=>getComputedStyle(element).gridTemplateColumns.split(' ').length)).toBe(4);
   expect(await page.locator('.status-report-table td').first().evaluate(element=>getComputedStyle(element).fontFamily)).toContain('Segoe UI');
   await page.screenshot({path:'test-results/reports-refresh-light.png',fullPage:true});
-  await page.getByLabel('Appearance',{exact:true}).selectOption('dark');
+  const toggle=page.getByRole('switch',{name:'Dark mode',exact:true});
+  if((await toggle.getAttribute('aria-checked'))!=='true')await toggle.click();
+  await expect(page.locator('html')).toHaveAttribute('data-theme','dark');
   await expect(page.locator('html')).toHaveAttribute('data-theme','dark');
   await page.screenshot({path:'test-results/reports-refresh-dark.png',fullPage:true});
   const received=metrics.getByRole('button',{name:'Received 60',exact:true});

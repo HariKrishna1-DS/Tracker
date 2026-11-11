@@ -27,8 +27,10 @@ class SlaManualTests(unittest.TestCase):
 
     def test_typing_rule_is_exact_and_preserves_priority(self):
         self.assertEqual(queue_rule({'TaskName': 'typingModule', 'TaskStatus': 'In\nProgress'})[1], 'Typing in Progress')
-        self.assertNotEqual(queue_rule({'TaskName': 'TypingModule', 'TaskStatus': 'Available'})[1], 'Typing in Progress')
+        self.assertEqual(queue_rule({'TaskName': 'TypingModule', 'TaskStatus': 'Available'})[1], 'Typing in Progress')
+        self.assertEqual(queue_rule({'TaskName': 'TypingModule', 'TaskStatus': 'Avavilable'})[1], 'Typing in Progress')
         self.assertNotEqual(queue_rule({'TaskName': 'Search', 'TaskStatus': 'In Progress'})[1], 'Typing in Progress')
+        self.assertNotEqual(queue_rule({'TaskName': 'Search', 'TaskStatus': 'Available'})[1], 'Typing in Progress')
         self.assertEqual(queue_rule({'Task Name': 'TypingModule', 'Task Status': 'In Progress',
             'ETA Comments': 'ON HOLD'})[1], 'Waiting for Effective Date')
         self.assertEqual(queue_rule({'Task Name': 'TypingModule', 'Task Status': 'In Progress',
@@ -187,9 +189,10 @@ class SlaManualTests(unittest.TestCase):
             'status': 'In House Pending', 'order_numbers': ['bad'], 'replacement': 'Search In Progress'})
         self.assertEqual(response.status_code, 200, response.json)
         after = self.client.get('/api/sla-status?preview_id=1').json
-        self.assertEqual(after['excluded_rows'][0]['Status'], 'Search In Progress')
-        self.assertEqual(after['excluded_count'], 1)
-        self.assertEqual(after['totals']['Grand Total'], 0)
+        self.assertEqual(after['rows'][0]['Status'], 'Search In Progress')
+        self.assertEqual(after['excluded_count'], 0)
+        self.assertEqual(after['totals']['Unknown SLA'], 1)
+        self.assertEqual(after['totals']['Grand Total'], 1)
 
 
 if __name__ == '__main__':

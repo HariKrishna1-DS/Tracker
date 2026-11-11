@@ -41,7 +41,7 @@ UPDATABLE = ('Status', 'ETA', 'Out Time', 'SLA Expiration')
 STATUS_NAMES = {s.casefold(): s for s in ('Awaiting for Clarification', 'Available',
     'Search In Progress', 'In Progress', 'Typing in Progress', 'Task Suspended', 'Completed and Delivered',
     'Cancelled', 'QC in Progress', 'Ready to Send', 'Assign to ABS', 'Waiting for Effective Date',
-    'SearchFix', 'Attorney Approval', 'Home Builder')}
+    'SearchFix', 'Attorney Approval', 'Home Builders')}
 STATUS_NAMES['need to assign abs'] = 'Assign to ABS'
 
 
@@ -641,7 +641,8 @@ def sync_trackers(frame=None, on_progress=None, book=None):
             current[title] = existing + extra
             additions[title] = extra
         created = frame.attrs.get('preview_created') if frame is not None else None
-        anchor = datetime.fromisoformat(created).astimezone(IST).replace(tzinfo=None) if created else datetime.now(IST).replace(tzinfo=None)
+        from portal_time import capture_time, PORTAL_TIMEZONE
+        anchor = capture_time(created) if created else datetime.now(PORTAL_TIMEZONE).replace(tzinfo=None)
         previous = []
         if committed:
             last_name = max(committed, key=lambda name: int(name[7:]))
@@ -739,8 +740,8 @@ def sync_trackers(frame=None, on_progress=None, book=None):
             if not raw_history:
                 raw_history = [{'Preview': preview, 'Preview Timestamp': anchor.isoformat()}]
             history_headers = list(dict.fromkeys(['Preview', 'Preview Timestamp'] + raw_headers))
-            for title in (('All Products', 'Sheet1') if publish_tracker_reports else ('Sheet1',)):
-                write(title, matrix(raw_history, history_headers), append=True)
+            write('All Products', matrix(incoming, raw_headers))
+            write('Sheet1', matrix(raw_history, history_headers), append=True)
         # These cached sheets are refreshed from tracker results on each sync. API reports
         # also reread live tracker values, including subsequent human edits.
         all_rows = [r for title in TRACKERS for r in merged[title] if key(r)]
@@ -754,7 +755,8 @@ def sync_trackers(frame=None, on_progress=None, book=None):
                                'Vendor Pending', 'In-House Pending', 'SLA OnTime', 'SLA on Missing']
             monthly_rows = [dict(row, **{'SLA on Missing': row.get('Missing', 0)})
                             for row in summaries['monthly']]
-            write('Monthly Orders', matrix(monthly_rows, monthly_columns))
+            write('Monthly Orders', [monthly_columns])
+            write('Daily Status Report', [['Date', 'Received', 'Completed', 'Clarification', 'Cancelled', 'Vendor Pending', 'In-House Pending', 'SLA On Time', 'SLA Missing']])
             write('PR Excel', capacity_report_values(summaries['monthly'], summaries['daily']))
         report['ambiguous_count'] = len(report['ambiguous'])
         report['not_in_latest_count'] = len(report['not_in_latest'])

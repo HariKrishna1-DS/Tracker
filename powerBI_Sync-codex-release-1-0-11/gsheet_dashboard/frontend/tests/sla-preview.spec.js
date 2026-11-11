@@ -120,8 +120,9 @@ test('preview selection updates SLA cards, statuses, detail rows, chart and down
   expect(publications).toEqual([2,2]);
   expect(refreshes).toEqual([]);
   await page.screenshot({path:'test-results/sla-preview-selector.png',fullPage:true,animations:'disabled'});
-  await page.getByRole('button',{name:'Overview',exact:true}).click();
-  await expect(page.getByRole('button',{name:'Production orders 35',exact:true})).toBeVisible();
+  await expect(page.getByRole('combobox',{name:'SLA preview'})).toHaveValue('2');
+  await page.getByRole('button',{name:'Captures',exact:true}).click();
+  await expect(page.getByText('preview3',{exact:true}).first()).toBeVisible();
   expect(errors).toEqual([]);
 });
 
@@ -143,7 +144,7 @@ test('an empty preview history shows zero SLA totals and never the production re
   const {errors}=await setup(page,{empty:true});
   await expect(page.getByRole('combobox',{name:'SLA preview'})).toBeDisabled();
   await expect(page.getByRole('button',{name:'Grand Total 0',exact:true})).toBeVisible();
-  await expect(page.getByText('No orders with a valid SLA expiration.',{exact:true})).toBeVisible();
+  await expect(page.getByText('No queue orders available.',{exact:true})).toBeVisible();
   expect(errors).toEqual([]);
 });
 

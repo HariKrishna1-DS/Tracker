@@ -78,7 +78,7 @@ class ReportWorkspace:
 
     def public(self):
         value = self.read()
-        public = {k: v for k, v in value.items() if k not in ('imported', 'cloud_baseline', 'tracker_status_baseline', 'other_tab_status_baseline', 'sheet_status_overrides', 'sheet_status_override_previews', 'sla_preview_statuses', 'sla_preview_order_edits', 'sla_preview_manual_orders', 'sla_preview_custom_statuses', 'sla_import_custom_statuses')}
+        public = {k: v for k, v in value.items() if k not in ('imported', 'sla_comparison_report', 'cloud_baseline', 'tracker_status_baseline', 'other_tab_status_baseline', 'sheet_status_overrides', 'sheet_status_override_previews', 'sla_preview_statuses', 'sla_preview_order_edits', 'sla_preview_manual_orders', 'sla_preview_custom_statuses', 'sla_import_custom_statuses')}
         effective = Counter(row.get('Source workbook', '') for row in (value.get('imported') or {}).get('rows', []))
         public['imports'] = [{'name': s['name'], 'rows': len(s['rows']), 'orders': len((value.get('imported') or {}).get('rows', [])) if s.get('legacy') else effective[s['name']],
                               'worksheets': len(s['files']), 'legacy': s.get('legacy', False)}
@@ -331,7 +331,9 @@ def capacity_report(reports, settings):
     days = [dict(row, Capacity=daily_capacity, **{'Ext capacity': extended}) for row in activity]
     # A Daily Orders selection must not move the live capacity table back to an
     # earlier month. Only an explicitly requested monthly export overrides IST.
-    month = settings.get('capacity_month') or current_capacity_month()
+    available_months = sorted({day['Date'][:7] for day in days if day['Date'] != 'Undated'})
+    current = current_capacity_month()
+    month = settings.get('capacity_month') or (current if current in available_months else (available_months[-1] if available_months else current))
     monthly = []
     for key in sorted({day['Date'][:7] for day in days}):
         items = [day for day in days if day['Date'].startswith(key)]
@@ -347,7 +349,7 @@ def capacity_report(reports, settings):
             'completion_date_basis': 'out_time' if out_time_only else 'completion_time'}
 
 
-def report_frames(snapshot, settings):
+def report_frames(snapshot, settings, sheet_publication=False):
     from tracker_sync import matrix
     from monthly_views import view_name, product_view_headers
     from sla_status import build_sla_status, sheet_summary_values, imported_date_snapshot
@@ -360,7 +362,9 @@ def report_frames(snapshot, settings):
     month = day['Date'][:7] if day and day['Date'] != 'Undated' else datetime.now().strftime('%Y-%m')
     detail_columns = product_view_headers(snapshot['sheets']['Full Title']['columns'])
     all_rows = snapshot['sheets']['Overview']['rows']
-    frames = {'All Products': matrix(all_rows, snapshot['sheets']['Overview']['columns'])}
+    latest = (snapshot.get('latest_preview', {'rows': [], 'columns': snapshot['sheets']['Overview']['columns']})
+              if sheet_publication else snapshot['sheets']['Overview'])
+    frames = {'All Products': matrix(latest['rows'], latest['columns'])}
     for full, label in ((True, 'Full Title'), (False, 'Remaining Products')):
         from status_updates import full_product
         rows = snapshot['sheets'][label]['rows'] if snapshot.get('mode') == 'excel' else [r for r in all_rows if full_product(r) == full]
@@ -368,14 +372,14 @@ def report_frames(snapshot, settings):
     status_columns = ['Status: ' + status for status in snapshot.get('statuses', [])]
     monthly_columns = ['Month'] + DAILY_COLUMNS[1:7] + ['SLA OnTime', 'SLA on Missing']
     monthly_rows = [dict(row, **{'SLA on Missing': row.get('Missing', 0)}) for row in reports['monthly']]
-    frames['Monthly Orders'] = matrix(monthly_rows, monthly_columns)
+    frames['Monthly Orders'] = [monthly_columns] if sheet_publication else matrix(monthly_rows, monthly_columns)
     daily_status_columns = DAILY_COLUMNS[:7] + ['SLA On Time', 'SLA Missing']
     daily_status = [dict(row, **{'SLA On Time': row.get('SLA OnTime', 0),
                                 'SLA Missing': row.get('Missing', 0)})
                     for row in sorted(reports['daily'], key=lambda row: row['Date'])]
     daily_total = {'Date': 'Total', **{column: sum(row.get(column, 0) for row in daily_status)
                                       for column in daily_status_columns[1:]}}
-    frames['Daily Status Report'] = matrix(daily_status + [daily_total], daily_status_columns)
+    frames['Daily Status Report'] = [daily_status_columns] if sheet_publication else matrix(daily_status + [daily_total], daily_status_columns)
     counts = Counter(str(r.get('Status', '')).strip() or '(Blank)' for r in all_rows)
     frames['Status Report'] = [['Status', 'Orders', 'Share']] + [[s, n, n / len(all_rows)] for s, n in counts.items()]
     sla_snapshot = snapshot.get('sla_snapshot', snapshot)
@@ -447,7 +451,7 @@ def publish_reports(book, snapshot, settings, backup_root, daily_only=False, _co
     from datatrace_sync import sheet_cell, sheet_color
     from tracker_formatting import format_requests, capacity_sheet_values, REPORT_COLORS
     from monthly_views import view_identity
-    frames, capacity = report_frames(snapshot, settings)
+    frames, capacity = report_frames(snapshot, settings, sheet_publication=True)
     all_products_frame = frames['All Products']
     if daily_only:
         # The tracker sync can refresh All Products between report publications.
@@ -464,7 +468,7 @@ def publish_reports(book, snapshot, settings, backup_root, daily_only=False, _co
     by_title = {s['properties']['title']: s for s in metadata}
     if daily_only and 'All Products' not in by_title:
         # An initial publication may still be pending when the date is chosen.
-        frames, capacity = report_frames(snapshot, settings)
+        frames, capacity = report_frames(snapshot, settings, sheet_publication=True)
         daily_only = False
     all_products_id = by_title.get('All Products', {}).get('properties', {}).get('sheetId')
     ids = {s['properties']['sheetId'] for s in metadata}
@@ -566,7 +570,7 @@ def publish_reports(book, snapshot, settings, backup_root, daily_only=False, _co
             retired_value_ranges.append(quoted + rowcol_to_a1(1, cols+1) + ':' +
                                         rowcol_to_a1(max(len(values), old_grid.get('rowCount', len(values))), old_cols))
             requests.append({'repeatCell': {'range': {'sheetId': number,
-                'endRowIndex': max(len(values), old_grid.get('rowCount', len(values))),
+                'endRowIndex': max(len(values)+25, old_grid.get('rowCount', 0)),
                 'startColumnIndex': cols, 'endColumnIndex': old_cols},
                 'cell': {}, 'fields': 'userEnteredValue'}})
             if not preserve_capacity_format and (title != 'SLA Status' or snapshot.get('sla_snapshot') is None):
@@ -635,7 +639,7 @@ def publish_reports(book, snapshot, settings, backup_root, daily_only=False, _co
                     requests.append({'updateEmbeddedObjectPosition': {'objectId': chart['chartId'], 'newPosition': {'overlayPosition': {'anchorCell': {'sheetId': number, 'rowIndex': len(values)+2, 'columnIndex': 0}, 'widthPixels': 900, 'heightPixels': 350}}, 'fields': 'anchorCell,widthPixels,heightPixels'}})
             else:
                 requests.append({'addChart': {'chart': {'spec': spec, 'position': {'overlayPosition': {'anchorCell': {'sheetId': number, 'rowIndex': len(values)+2, 'columnIndex': 0}, 'widthPixels': 900, 'heightPixels': 350}}}}})
-    date_filter = all_products_date_filter(all_products_id, all_products_frame, settings.get('selected_date', ''))
+    date_filter = all_products_date_filter(all_products_id, all_products_frame, '')
     if date_filter and not only_titles:
         requests.append(date_filter)
     if not daily_only and not only_titles:
@@ -719,6 +723,9 @@ def register_report_routes(app, workspace, gate, load_snapshot, get_book, invali
                 snapshot = (imported_snapshot(settings['imported'])
                             if settings['mode'] == 'excel' and settings.get('imported')
                             else load_snapshot(force=True, tracker_only=True))
+                previews = workspace.store.list()
+                latest_preview = workspace.store.get(previews[0]['id']) if previews else {'rows': [], 'columns': []}
+                snapshot = dict(snapshot, latest_preview=latest_preview)
                 if settings['mode'] == 'tracker':
                     from sla_status import preview_snapshot
                     snapshot = dict(snapshot, sla_snapshot=preview_snapshot(workspace.store, settings, production=snapshot))
@@ -1095,6 +1102,11 @@ def register_report_routes(app, workspace, gate, load_snapshot, get_book, invali
             from sla_import_manual import decorate
             snapshot = decorate(snapshot, settings)
             return dict(build_sla_status(snapshot), sync_error=settings.get('cloud_refresh_error'))
+        return load_preview_sla_report(preview_id)
+
+    def load_preview_sla_report(preview_id=None):
+        from sla_status import build_sla_status, preview_snapshot, tracker_status_rows
+        settings = workspace.read()
         raw = request.args.get('preview_id') if preview_id is None else preview_id
         if raw is not None and (isinstance(raw, bool) or not str(raw).isdecimal() or int(raw) < 1):
             raise ValueError('Choose a valid saved preview.')
@@ -1113,6 +1125,9 @@ def register_report_routes(app, workspace, gate, load_snapshot, get_book, invali
                 # A saved preview remains usable while its tracker is offline.
                 pass
         return dict(build_sla_status(snapshot), sync_error=settings.get('sla_sync_error'))
+
+    from production_export import register_production_export
+    register_production_export(app, workspace, load_preview_sla_report)
 
     def publish_selected_sla(report):
         from sla_status import publish_preview_sla
@@ -1474,6 +1489,221 @@ def register_report_routes(app, workspace, gate, load_snapshot, get_book, invali
         book.save(stream)
         stream.seek(0)
         filename = requested_sheet.replace(' ', '_') + '.xlsx' if requested_sheet else 'Production_data.xlsx'
+        return send_file(stream, as_attachment=True, download_name=filename,
+                         mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+
+    saved_comparison = workspace.read().get('sla_comparison_report') or {}
+    sla_comparison_cache = {'result': None, 'rows': saved_comparison.get('rows'),
+                            'filename': saved_comparison.get('filename'), 'active_rows': None}
+
+    @app.route('/api/sla-compare', methods=['GET', 'POST'])
+    def sla_compare_endpoint():
+        from sla_compare import read_production_file, compare_sla_with_production
+        try:
+            preview_id = request.args.get('preview_id')
+            if not preview_id and request.form:
+                preview_id = request.form.get('preview_id')
+            if preview_id and str(preview_id).isdecimal():
+                preview_id = int(preview_id)
+            else:
+                preview_id = None
+
+            clear_report = request.args.get('clear') in ('1', 'true') or (request.form.get('clear') in ('1', 'true') if request.form else False)
+            if clear_report:
+                # An explicit empty report suppresses imported-report fallback on
+                # subsequent reads and after restart, until the user uploads again.
+                workspace.save(sla_comparison_report={'rows': [], 'filename': None, 'cleared': True})
+                sla_comparison_cache['rows'] = []
+                sla_comparison_cache['filename'] = None
+                sla_comparison_cache['result'] = None
+                sla_comparison_cache['active_rows'] = []
+
+            uploaded_files = request.files.getlist('files') or ([request.files['file']] if 'file' in request.files else [])
+            use_sample = request.args.get('sample') in ('1', 'true') or (request.form.get('sample') in ('1', 'true'))
+
+            prod_rows = []
+            source_names = []
+            source_warning = None
+            if uploaded_files and any(f.filename for f in uploaded_files):
+                for f in uploaded_files:
+                    if f.filename:
+                        content = f.read()
+                        f_rows = read_production_file(content, filename=f.filename)
+                        prod_rows.extend(f_rows)
+                        source_names.append(f.filename)
+                sla_comparison_cache['rows'] = prod_rows
+                sla_comparison_cache['filename'] = ', '.join(source_names)
+                workspace.save(sla_comparison_report={'rows': prod_rows, 'filename': ', '.join(source_names)})
+            elif use_sample:
+                from sync_config import BASE_DIR
+                sample_dir = BASE_DIR / 'sample_production'
+                if sample_dir.is_dir() and any(sample_dir.glob('*.xlsx')):
+                    for p in sorted(sample_dir.glob('*.xlsx')):
+                        prod_rows.extend(read_production_file(p))
+                        source_names.append(p.name)
+                elif (BASE_DIR / 'sample_production_report.csv').is_file():
+                    p = BASE_DIR / 'sample_production_report.csv'
+                    prod_rows.extend(read_production_file(p))
+                    source_names.append(p.name)
+                sla_comparison_cache['rows'] = prod_rows
+                sla_comparison_cache['filename'] = ', '.join(source_names) if source_names else 'Sample Report'
+            elif sla_comparison_cache.get('rows') is not None:
+                prod_rows = sla_comparison_cache['rows']
+                source_names = [sla_comparison_cache.get('filename') or 'Uploaded Report'] if prod_rows else []
+            elif workspace.read().get('imported') and not clear_report:
+                settings = workspace.read()
+                # Comparing an imported report must not replace its statuses with cloud values.
+                rows = imported_snapshot(settings['imported'])['sheets']['Overview']['rows']
+                prod_rows = [{
+                    'order_number': str(row.get('Order Number', '')).strip(),
+                    'status': row.get('Status', ''),
+                    'product': row.get('Product', ''), 'state': row.get('State', ''),
+                    'county': row.get('County', ''), 'client': row.get('Client', ''),
+                    'in_time': row.get('In-Time', ''), 'out_time': row.get('Out Time', ''),
+                    'prod_sla': '',
+                    'searcher': row.get('Searcher', ''), 'typer': row.get('Typer', ''),
+                    'comments': row.get('Comments', ''), 'source_sheet': 'Imported Excel'
+                } for row in rows]
+                source_names = ['Imported Excel reports']
+            else:
+                prod_rows = []
+                source_names = []
+
+            sla_report = load_preview_sla_report(preview_id)
+            preview_name = sla_report.get('preview_name') or (f"preview{preview_id}" if preview_id else "Latest preview")
+
+            result = compare_sla_with_production(sla_report, prod_rows, preview_name=preview_name)
+            result['source_files'] = ', '.join(source_names)
+            result['source_warning'] = source_warning
+            result['selected_preview_id'] = preview_id or sla_report.get('preview_id')
+            result['previews'] = sla_report.get('previews', [])
+            sla_comparison_cache['active_rows'] = prod_rows
+            sla_comparison_cache['result'] = result
+
+            return jsonify(result)
+        except Exception as exc:
+            app.logger.exception('SLA compare failed')
+            return jsonify(error=str(exc)), 400
+
+    @app.route('/api/sla-compare/update-status', methods=['POST'])
+    def sla_compare_update_status():
+        from sla_compare import update_order_production_status
+        try:
+            payload = request.get_json(force=True) or {}
+            order_number = payload.get('order_number')
+            prod_status = payload.get('prod_status')
+            if not order_number or not prod_status:
+                return jsonify(error='order_number and prod_status are required'), 400
+
+            result = sla_comparison_cache.get('result')
+            if not result:
+                return jsonify(error='No active SLA comparison session found'), 400
+
+            updated = update_order_production_status(
+                result,
+                order_number,
+                prod_status,
+                prod_rows=sla_comparison_cache.get('rows')
+            )
+            if sla_comparison_cache.get('rows') is not None:
+                workspace.save(sla_comparison_report={'rows': sla_comparison_cache['rows'],
+                                                     'filename': sla_comparison_cache['filename']})
+            return jsonify(ok=True, result=updated)
+        except Exception as exc:
+            app.logger.exception('Failed to update production status')
+            return jsonify(error=str(exc)), 400
+
+    @app.post('/api/sla-compare/expiration')
+    def sla_compare_expiration():
+        from copy import deepcopy
+        from import_identity import number_key
+        from sla_manual import find_order, revision
+        from sla_compare import compare_sla_with_production
+        body = request.get_json(silent=True) or {}
+        if not isinstance(body, dict):
+            return jsonify(error='Enter valid SLA expiration details.'), 400
+        current = sla_comparison_cache.get('result')
+        if not current or type(body.get('preview_id')) is not int or body['preview_id'] != current.get('selected_preview_id'):
+            return jsonify(error='The selected preview changed. Refresh the comparison and try again.'), 409
+        if not gate.acquire(blocking=False):
+            return jsonify(error='Wait for the current capture or Sheets update to finish, then save.'), 409
+        try:
+            with sync_lock(workspace.store.root), workspace.lock:
+                expiry = body.get('expiration')
+                if not isinstance(expiry, str) or len(expiry) > 40 or not ('T' in expiry or ' ' in expiry):
+                    raise ValueError('Choose a valid SLA expiration date and time.')
+                try:
+                    expiration = datetime.fromisoformat(expiry)
+                except ValueError:
+                    raise ValueError('Choose a valid SLA expiration date and time.')
+                if expiration.tzinfo:
+                    raise ValueError('Use the date and time shown in SLA Status, without a timezone offset.')
+                report = load_preview_sla_report(body['preview_id'])
+                number = body.get('order_number')
+                if not isinstance(number, str) or not number.strip():
+                    raise ValueError('Choose an order from the selected preview.')
+                row = find_order(report, number)
+                if row is None or body.get('expected_revision') != revision(row):
+                    return jsonify(error='This SLA order changed. Refresh the comparison before editing it.'), 409
+                settings = workspace.read()
+                edits = deepcopy(settings.get('sla_preview_order_edits') or {})
+                edits.setdefault(str(report['preview_id']), {}).setdefault(number_key(row), {})['SLA Expiration'] = expiration.isoformat(sep=' ', timespec='minutes')
+                from workspace_backup import save_safety_backup
+                save_safety_backup(workspace.store, 'before-update')
+                workspace.save(sla_preview_order_edits=edits)
+                report = load_preview_sla_report(body['preview_id'])
+                updated = compare_sla_with_production(report, sla_comparison_cache['active_rows'] or [],
+                                                     preview_name=report['preview_name'])
+                updated.update({key: current.get(key) for key in ('source_files', 'source_warning', 'selected_preview_id', 'previews')})
+                sla_comparison_cache['result'] = updated
+                return jsonify(ok=True, result=updated)
+        except ValueError as exc:
+            return jsonify(error=str(exc)), 400
+        finally:
+            gate.release()
+
+    @app.get('/api/sla-compare/export')
+    def sla_compare_export_endpoint():
+        from sla_compare import export_comparison_excel
+        res = sla_comparison_cache.get('result')
+        if not res:
+            return jsonify(error='No active SLA comparison to export. Run a comparison first.'), 400
+        table_scope = request.args.get('table', 'all')
+        filter_type = request.args.get('filter_type')
+        sla_status = request.args.get('sla_status')
+        prod_status = request.args.get('prod_status')
+        summary_status = request.args.get('summary_status')
+        category = request.args.get('category')
+        from_status = request.args.get('from_status')
+        to_status = request.args.get('to_status')
+        search = request.args.get('q')
+
+        stream = export_comparison_excel(
+            res,
+            table_scope=table_scope,
+            filter_type=filter_type,
+            sla_status=sla_status,
+            prod_status=prod_status,
+            summary_status=summary_status,
+            category=category,
+            from_status=from_status,
+            to_status=to_status,
+            search=search,
+        )
+        preview_label = res.get('preview_name', 'sla').replace(' ', '_')
+        if table_scope == 'sla_summary':
+            filename = f"SLA_Status_Summary_{preview_label}.xlsx"
+        elif table_scope == 'movements':
+            filename = f"Status_Movements_{preview_label}.xlsx"
+        elif table_scope == 'orders':
+            suffix = f"_{filter_type}" if filter_type else ""
+            if sla_status:
+                clean_s = re.sub(r'[^a-zA-Z0-9]', '_', sla_status)
+                suffix += f"_{clean_s}"
+            filename = f"Comparison_Orders{suffix}_{preview_label}.xlsx"
+        else:
+            filename = f"SLA_Production_Compare_{preview_label}.xlsx"
+
         return send_file(stream, as_attachment=True, download_name=filename,
                          mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
 

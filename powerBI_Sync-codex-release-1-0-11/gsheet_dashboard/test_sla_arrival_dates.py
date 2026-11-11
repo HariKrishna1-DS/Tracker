@@ -180,8 +180,8 @@ class SlaArrivalDatesTests(unittest.TestCase):
         ]))])
         data['created'] = '2026-10-19T12:00:00Z'
         report = build_sla_status(imported_date_snapshot(imported_snapshot(data)))
-        self.assertEqual(report['totals']['Today SLA'], 1)
-        self.assertEqual(report['totals']['Future SLA'], 1)
+        self.assertEqual(report['totals']['Today SLA'], 2)
+        self.assertEqual(report['totals']['Future SLA'], 0)
 
 
 if __name__ == '__main__':

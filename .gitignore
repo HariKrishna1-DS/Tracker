@@ -1,0 +1,10 @@
+/.venv/
+/.publish-powerbi/
+/.publish-powerbi-test-temp/
+/.release-test-temp/
+/.release-*-test-temp/
+/.release*.log
+/.publish*.log
+/.release-19-github.py
+/.release-19-state.json
+/.release-19-paths.txt

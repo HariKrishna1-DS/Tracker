@@ -79,7 +79,7 @@ def run_extractor(command, cwd, env, cancel_event, on_progress):
                 stage = 'Loading the configured queue'
             elif 'Waiting for queue grid' in line:
                 stage = 'Waiting for queue results'
-            elif 'Loading queue results with Refresh' in line:
+            elif 'Loading queue results with Refresh' in line or 'Refreshing current queue results with Refresh' in line:
                 stage = 'Refreshing queue results'
             elif '[+] Queue page ' in line:
                 stage = 'Extracting ' + line.strip().removeprefix('[+] ').lower()
@@ -318,12 +318,9 @@ def sla_expiration(row):
 
 
 def capture_anchor(value):
-    """Capture instants use IST; imported order timestamps remain wall clocks."""
-    try:
-        parsed = dt.datetime.fromisoformat(str(value).replace('Z', '+00:00'))
-        return parsed.astimezone(dt.timezone(dt.timedelta(hours=5, minutes=30))).replace(tzinfo=None) if parsed.tzinfo else parsed
-    except ValueError:
-        return parse_report_datetime(value)
+    """Interpret capture instants in the same US Central clock as portal dates."""
+    from portal_time import capture_time
+    return capture_time(value)
 
 
 def report_frame(df, fields, product=None, selected_products=None):
@@ -680,7 +677,8 @@ def run_sync(on_progress=None, auto_sync=True, cancel_event=None):
         with tempfile.TemporaryDirectory(prefix='datatrace-') as folder:
             output = Path(folder) / 'queue.json'
             env = dict(os.environ, DATATRACE_OUTPUT_JSON=str(output),
-                       DATATRACE_DIAGNOSTICS_DIR=str(BASE_DIR / 'extractor-diagnostics'))
+                       DATATRACE_DIAGNOSTICS_DIR=str(BASE_DIR / 'extractor-diagnostics'),
+                       DATATRACE_HEADLESS='false')
             extractor = Path(os.environ.get('DATATRACE_EXTRACTOR_DIR', str(ASSET_DIR)))
             node = os.environ.get('DATATRACE_NODE_EXECUTABLE', 'node')
             env.pop('GOOGLE_SERVICE_ACCOUNT_JSON', None)

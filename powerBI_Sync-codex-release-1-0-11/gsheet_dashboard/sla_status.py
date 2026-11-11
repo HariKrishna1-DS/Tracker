@@ -3,9 +3,11 @@ from collections import Counter
 from datetime import date, datetime, timedelta, timezone
 from io import BytesIO
 import re
+from portal_time import PORTAL_TIMEZONE
 
 IST = timezone(timedelta(hours=5, minutes=30))
 CATEGORIES = ['Future SLA', 'Negative SLA', 'Today SLA']
+COUNTDOWN = re.compile(r'(-)?(?:(\d+)d\s*)?(?:(\d+)h\s*)?(?:(\d+)m\s*)?', re.I)
 SUMMARY_COLUMNS = ['Status', *CATEGORIES, 'Grand Total']
 DETAIL_COLUMNS = ['Order Number', 'SLA Expiration', 'SLA', 'Online/ Ground',
                   'Client', 'Product', 'St', 'County', 'Municipality',
@@ -40,11 +42,14 @@ def queue_field(row, name):
 
 def special_product_status(raw):
     """Recognize full names and the portal's displayed, ellipsized product labels."""
+    # The portal also exports product variants such as Home Builder L...
+    if re.match(r'^home\s*builders?\b', raw.strip(), re.I):
+        return 'Home Builders'
     product = re.sub(r'[^a-z0-9]', '', raw.casefold())
     truncated = bool(re.search(r'(?:\.{2,}|\u2026)\s*$', raw))
     for status, names, prefix in (
             ('Attorney Approval', ('attorneyapproval', 'attorneyapproach'), 'attorneyapp'),
-            ('Home Builder', ('homebuilder', 'homebuilders'), 'homebuil')):
+            ('Home Builders', ('homebuilder', 'homebuilders'), 'homebuil')):
         if product in names or (truncated and product.startswith(prefix)
                                 and any(name.startswith(product) for name in names)):
             return status
@@ -65,6 +70,17 @@ def queue_rule(row, as_of=None):
     product, task = compact(queue_field(row, 'Product')), compact(queue_field(row, 'Task Name'))
     comments = queue_field(row, 'ETA Comments')
     task_status = compact(queue_field(row, 'Task Status'))
+    workflow_suspended = task_status == 'workflowsuspended' or task == 'workflowsuspended'
+    portal_comments = ' '.join(queue_field(row, name) for name in ('Comment', 'Comments'))
+    if workflow_suspended:
+        if task_status == 'workflowsuspended' and re.search(r'\bon\s+hold\b', comments, re.I):
+            return -0.5, 'Awaiting for Clarification', 'Workflow suspended; ETA Comments contains ON HOLD'
+        if re.search(r'\bcannot\b', portal_comments, re.I):
+            return -0.5, 'Awaiting for Clarification', 'Workflow suspended; Comment contains Cannot'
+        if task in ('searchfix', 'crsp2'):
+            return -0.5, 'Awaiting for Clarification', 'Workflow suspended SearchFix task'
+        if re.search(r'\babst(?:raction|ractor|ractors|ract|racts)?\b', comments, re.I):
+            return -0.5, 'Awaiting for Clarification', 'Workflow suspended; ETA Comments references abstraction'
     if task in ('crsp2', 'searchfix'):
         return 0, 'SearchFix', 'Task Name is CRSP2' if task == 'crsp2' else 'Task Name is SearchFix'
     if product in ('clientreview', 'qualitycontrol', 'quailtycontrol'):
@@ -84,8 +100,9 @@ def queue_rule(row, as_of=None):
         evidence = assigned or abstractor or commitment
         reason = f'ETA Comments contains {" ".join(evidence.group(0).split())}'
         return 4, 'Assign to ABS', reason
-    if task == 'typingmodule' and task_status == 'inprogress':
-        return 5, 'Typing in Progress', 'Task Name is TypingModule and Task Status is In Progress'
+    if task == 'typingmodule' and (task_status in ('inprogress', 'tasksuspended', 'available', 'avavilable') or 'avail' in task_status):
+        status_label = 'In Progress' if task_status == 'inprogress' else 'Available' if 'avail' in task_status else 'Task Suspended'
+        return 5, 'Typing in Progress', f'Task Name is TypingModule and Task Status is {status_label}'
     from tracker_sync import suspended
     if suspended(dict(row, **{'Task Status': queue_field(row, 'Task Status')})):
         return 6, 'Awaiting for Clarification', 'Workflow is suspended'
@@ -93,9 +110,7 @@ def queue_rule(row, as_of=None):
     if (last_user in ('', '(blank)', 'null', 'none', 'n/a', '-')
             and task_status == 'available'):
         return 7, 'Search In Progress', 'Last User is blank and Task Status is Available'
-    if task_status == 'tasksuspended':
-        return 8, 'Typing in Progress', 'Task Status is Task Suspended; no higher-priority queue rule matches'
-    return 9, '', ''
+    return 8, '', ''
 
 
 def completion_status(value):
@@ -136,7 +151,6 @@ def queue_orders(preview, as_of=None, *, rule=None):
 def preview_snapshot(store, settings=None, preview_id=None, production=None, as_of=None):
     """Only orders present in the selected queue, with SLA-specific status rules."""
     settings = settings or {}
-    as_of = as_of or datetime.now(IST)
     previews = store.list()
     if preview_id is not None:
         preview = store.get(preview_id)
@@ -144,6 +158,9 @@ def preview_snapshot(store, settings=None, preview_id=None, production=None, as_
         saved = settings.get('sla_preview_id')
         selected = next((p for p in previews if p['id'] == saved), None) or next(iter(previews), None)
         preview = store.get(selected['id']) if selected else None
+    as_of = as_of or (local_time(preview['created']) if preview else None) or datetime.now(PORTAL_TIMEZONE)
+    if as_of.tzinfo:
+        as_of = as_of.astimezone(PORTAL_TIMEZONE).replace(tzinfo=None)
     from reporting_dates import latest_arrival
     from status_updates import status_name
     reference = latest_arrival(preview['rows']) if preview else None
@@ -283,31 +300,39 @@ def rename_preview_status(workspace, snapshot, old, new, selected, individual=Fa
 
 
 def local_time(value):
-    from monthly_production import local_datetime
-    if isinstance(value, datetime):
-        parsed = value
-    else:
-        try:
-            parsed = datetime.fromisoformat(str(value).strip().replace('Z', '+00:00'))
-        except ValueError:
-            parsed = local_datetime(value)
-    return (parsed.astimezone(IST).replace(tzinfo=None) if parsed.tzinfo else parsed) if parsed else None
+    from portal_time import capture_time
+    return capture_time(value)
 
 
-def category(value, as_of, anchor=None):
+def category(value, as_of, anchor=None, raw_countdown=None):
     from monthly_production import local_datetime
-    raw = str(value if value is not None else '').strip()
+    # Check 1-day or relative countdown first if available
+    countdown = str(raw_countdown or '').replace('\u2212', '-').strip()
+    match_cd = re.fullmatch(r'(-)?(?:(\d+)d\s*)?(?:(\d+)h\s*)?(?:(\d+)m\s*)?', countdown, re.I)
+    if match_cd and any(match_cd.groups()[1:]):
+        if match_cd[1]:
+            return 'Negative SLA'
+        days = int(match_cd[2] or 0)
+        if days == 1:
+            return 'Today SLA'
+        due = (anchor or as_of) + timedelta(days=days, hours=int(match_cd[3] or 0), minutes=int(match_cd[4] or 0))
+        return 'Today SLA' if due.date() == as_of.date() else 'Negative SLA' if due.date() < as_of.date() else 'Future SLA'
+
+    raw = str(value if value is not None else '').replace('\u2212', '-').strip()
     if not raw:
         return ''
     # Queue exports express overdue deadlines as signed elapsed durations.
-    relative = re.fullmatch(r'(-)?(?:(\d+)d\s*)?(?:(\d+)h\s*)?(?:(\d+)m\s*)?', raw, re.I)
+    relative = COUNTDOWN.fullmatch(raw)
     if relative and any(relative.groups()[1:]):
         if relative[1]:
             return 'Negative SLA'
         days, hours, minutes = (int(part or 0) for part in relative.groups()[1:])
+        if days == 1:
+            return 'Today SLA'
         due = (anchor or as_of) + timedelta(days=days, hours=hours, minutes=minutes)
     else:
-        due = local_datetime(value)
+        from tracker_sync import deadline
+        due = local_datetime(value) or (deadline(value, anchor or as_of) if (anchor or as_of) else None)
     if due is None:
         return ''
     return 'Today SLA' if due.date() == as_of.date() else 'Negative SLA' if due.date() < as_of.date() else 'Future SLA'
@@ -338,34 +363,55 @@ def build_sla_status(snapshot, as_of=None):
     from reporting_dates import arrival_details
     selected_day = snapshot.get('report_date')
     reference = local_datetime(snapshot.get('sla_reference_at'))
-    as_of = as_of or (datetime.fromisoformat(selected_day) if selected_day and selected_day != 'Undated'
-                      else reference or local_time(snapshot.get('updated_at')) or datetime.now(IST))
+    sheets = snapshot.get('sheets', {})
+    source = sheets.get('Overview') or sheets.get('All Products') or {'rows': [], 'columns': []}
+
+    # A saved queue describes its capture, not the day on which it is reopened.
+    captured_at = local_time(snapshot.get('updated_at'))
+    # Portal timestamps can be on the next calendar day at the capture boundary.
+    # Ignore implausibly distant arrival dates and never consult today's date.
+    portal_reference = reference if reference and (not captured_at or
+        abs((reference.date() - captured_at.date()).days) <= 1) else None
+    if as_of is None:
+        if snapshot.get('report_scope') == 'imported_date' and selected_day and selected_day != 'Undated':
+            as_of = datetime.fromisoformat(selected_day)
+        else:
+            as_of = portal_reference or captured_at or reference or datetime.now(PORTAL_TIMEZONE)
     if isinstance(as_of, date) and not isinstance(as_of, datetime):
         as_of = datetime.combine(as_of, datetime.min.time())
     if as_of.tzinfo:
-        as_of = as_of.replace(tzinfo=None)
-    sheets = snapshot.get('sheets', {})
-    source = sheets.get('Overview') or sheets.get('All Products') or {'rows': [], 'columns': []}
-    anchor = as_of if snapshot.get('report_scope') == 'imported_date' else local_time(snapshot.get('updated_at'))
+        as_of = as_of.astimezone(PORTAL_TIMEZONE).replace(tzinfo=None)
+    anchor = as_of if snapshot.get('report_scope') == 'imported_date' else (captured_at or as_of)
+    if snapshot.get('report_scope') == 'preview':
+        # The captured positive countdown belongs to this queue's SLA day.
+        anchor = as_of.replace(hour=0, minute=0, second=0, microsecond=0)
     rows, excluded, counts = [], [], Counter()
     for original in source['rows']:
         if not str(original.get('Order Number') or '').strip():
             continue
-        expiry = original.get('SLA Expiration', original.get('SLA Expiration*'))
-        result = category(expiry, as_of, anchor)
+        expiry = original.get('SLA Expiration') or original.get('SLA Expiration*')
+        raw_cd = original.get('SLA Expiration*') or original.get('SLA Expiration')
+        result = category(expiry, as_of, anchor, raw_countdown=raw_cd)
+        if str(original.get('SLA Expiration Overdue', '')).strip().casefold() in ('true', '1', 'yes'):
+            result = 'Negative SLA'
         row = dict(original, **arrival_details(original), **{'SLA Category': result})
         row['Status'] = status_name(original.get('Status') or original.get('Task Status') or '(Blank)')
+        if not result and snapshot.get('report_scope') == 'preview':
+            result = row['SLA Category'] = 'Unknown SLA'
+            row['SLA issue'] = 'Missing SLA expiration' if not str(expiry or '').strip() else 'Invalid SLA expiration'
         if not result:
-            row['SLA issue'] = 'Missing SLA expiration' if not str(original.get('SLA Expiration') or '').strip() else 'Invalid SLA expiration'
+            row['SLA issue'] = 'Missing SLA expiration' if not str(expiry or '').strip() else 'Invalid SLA expiration'
             excluded.append(row)
             continue
         counts[row['Status'], result] += 1
         rows.append(row)
     custom = list(dict.fromkeys(status_name(status) for status in snapshot.get('custom_statuses') or []))
     statuses = sorted({status for status, _ in counts} | set(custom), key=str.casefold)
-    summary = [dict(Status=status, **{key: counts[status, key] for key in CATEGORIES},
-                    **{'Grand Total': sum(counts[status, key] for key in CATEGORIES)}) for status in statuses]
-    totals = dict(Status='Grand Total', **{key: sum(row[key] for row in summary) for key in CATEGORIES},
+    categories = CATEGORIES + (['Unknown SLA'] if any(row['SLA Category'] == 'Unknown SLA' for row in rows) else [])
+    summary_columns = ['Status', *categories, 'Grand Total']
+    summary = [dict(Status=status, **{key: counts[status, key] for key in categories},
+                    **{'Grand Total': sum(counts[status, key] for key in categories)}) for status in statuses]
+    totals = dict(Status='Grand Total', **{key: sum(row[key] for row in summary) for key in categories},
                   **{'Grand Total': len(rows)})
     from import_identity import number_key
     counted = {number_key(row): row for row in rows + excluded}
@@ -378,11 +424,12 @@ def build_sla_status(snapshot, as_of=None):
                                   'Counted SLA': counted[number_key(row)]['SLA Category'],
                                   'Applied status condition': counted[number_key(row)].get('Status Reason', '')})
                       for row in snapshot.get('duplicate_rows') or []]
-    return {'as_of': as_of.date().isoformat(), 'date_basis': 'arrival_time' if reference or selected_day and selected_day != 'Undated' else 'capture_time',
+    date_basis = 'selected_date' if selected_day and selected_day != 'Undated' else 'arrival_time' if portal_reference else 'capture_time'
+    return {'as_of': as_of.date().isoformat(), 'date_basis': date_basis,
             'sla_reference_at': reference.isoformat() if reference else None, 'rows': rows, 'excluded_rows': excluded,
             'excluded_count': len(excluded), 'summary': summary, 'totals': totals,
             'columns': list(dict.fromkeys(source.get('columns', []) + ['Arrival Date', 'Arrival Time', 'SLA Category'])),
-            'summary_columns': SUMMARY_COLUMNS, **{key: snapshot.get(key) for key in (
+            'summary_columns': summary_columns, **{key: snapshot.get(key) for key in (
                 'source', 'mode', 'offline', 'updated_at', 'report_scope', 'preview_id',
                 'preview_name', 'preview_row_count', 'previews', 'captured_order_count',
                 'duplicate_order_count', 'duplicate_row_count', 'missing_order_number_count', 'duplicate_rows',
@@ -392,20 +439,21 @@ def build_sla_status(snapshot, as_of=None):
 
 
 def summary_values(report):
-    return [SUMMARY_COLUMNS] + [[row[column] for column in SUMMARY_COLUMNS]
+    columns = report['summary_columns']
+    return [columns] + [[row[column] for column in columns]
         for row in report['summary'] + [report['totals']]]
 
 
 def sheet_summary_values(report):
     """Reference layout, with empty category counts displayed as blank cells."""
-    return [['Count of Order Number', 'Column Labels', '', '', '']] + [
-        [value if index in (0, 4) or value else '' for index, value in enumerate(row)]
+    return [['Count of Order Number', 'Column Labels'] + [''] * (len(report['summary_columns'])-2)] + [
+        [value if index in (0, len(row)-1) or value else '' for index, value in enumerate(row)]
         for row in summary_values(report)]
 
 
 def sheet_format_requests(sheet_id, values, existing):
     """Keep the SLA table plain, including when replacing an older colored report."""
-    table = {'sheetId': sheet_id, 'endRowIndex': len(values), 'endColumnIndex': 5}
+    table = {'sheetId': sheet_id, 'endRowIndex': len(values), 'endColumnIndex': len(values[1])}
     requests = [{'deleteConditionalFormatRule': {'sheetId': sheet_id, 'index': index}}
                 for index in reversed(range(len(existing.get('conditionalFormats', []))))]
     requests.append({'repeatCell': {'range': {'sheetId': sheet_id},
@@ -449,7 +497,7 @@ def add_excel_pivot(summary, detail, report):
     from openpyxl.pivot.table import (TableDefinition, Location, PivotField, FieldItem,
                                      RowColField, RowColItem, DataField, PivotTableStyle)
     statuses = [row['Status'] for row in report['summary']]
-    dimensions = {2: CATEGORIES, 11: statuses}
+    dimensions = {2: report['summary_columns'][1:-1], 11: statuses}
     lookups = {column: {value: index for index, value in enumerate(values)} for column, values in dimensions.items()}
     fields = [CacheField(name=name, sharedItems=SharedItems(
         _fields=[Text(v=value) for value in dimensions.get(column, [])]))
@@ -473,9 +521,9 @@ def add_excel_pivot(summary, detail, report):
     pivot = TableDefinition(name='SLAStatusPivot', cacheId=1, dataCaption='Values',
         rowHeaderCaption='Status', compact=False, compactData=False, outline=False, outlineData=False,
         rowGrandTotals=True, colGrandTotals=True,
-        location=Location(ref=f'A3:E{len(statuses)+5}', firstHeaderRow=1, firstDataRow=2, firstDataCol=1),
+        location=Location(ref=f'A3:{chr(64+len(report["summary_columns"]))}{len(statuses)+5}', firstHeaderRow=1, firstDataRow=2, firstDataCol=1),
         pivotFields=pivot_fields, rowFields=[RowColField(x=11)], rowItems=items(len(statuses)),
-        colFields=[RowColField(x=2)], colItems=items(3),
+        colFields=[RowColField(x=2)], colItems=items(len(dimensions[2])),
         dataFields=[DataField(name='Count of Order Number', fld=0, subtotal='count')],
         pivotTableStyleInfo=PivotTableStyle(name='PivotStyleLight16', showRowHeaders=True,
             showColHeaders=True, showRowStripes=False, showColStripes=False, showLastColumn=True))
@@ -501,7 +549,7 @@ def excel_report(report):
     summary.append(['Count of Order Number', 'Column Labels'])
     for values in summary_values(report):
         # The reference displays zero category cells as blanks.
-        summary.append([value if index == 0 or value or index == 4 else None
+        summary.append([value if index == 0 or value or index == len(values)-1 else None
                         for index, value in enumerate(values)])
     detail = book.create_sheet('Sheet1')
     detail.append(DETAIL_COLUMNS)
@@ -540,10 +588,10 @@ def excel_report(report):
         chart.title = 'SLA Status'
         chart.x_axis.title = 'Orders'
         chart.y_axis.title = 'Status'
-        chart.add_data(Reference(summary, min_col=2, max_col=4, min_row=4, max_row=summary.max_row-1), titles_from_data=True)
+        chart.add_data(Reference(summary, min_col=2, max_col=len(report['summary_columns'])-1, min_row=4, max_row=summary.max_row-1), titles_from_data=True)
         chart.set_categories(Reference(summary, min_col=1, min_row=5, max_row=summary.max_row-1))
         chart.width, chart.height = 27, max(12, len(report['summary']) * 0.65)
-        for series, color in zip(chart.series, COLORS):
+        for series, color in zip(chart.series, COLORS + ['#a8c5ed']):
             series.graphicalProperties.solidFill = color.lstrip('#')
         summary.add_chart(chart, 'G4')
     stream = BytesIO()
@@ -561,6 +609,15 @@ def sheet_chart_requests(sheet_id, values, existing, preserve_format=False):
         from copy import deepcopy
         spec = deepcopy(chart['spec'])
         basic = spec['basicChart']
+        target_count = len(values[1])-2
+        series = basic.setdefault('series', [])
+        while len(series) < target_count:
+            index = len(series)+1
+            series.append({'series': {'sourceRange': {'sources': [{'sheetId': sheet_id,
+                'startRowIndex': 1, 'endRowIndex': len(values)-1,
+                'startColumnIndex': index, 'endColumnIndex': index+1}]}},
+                'targetAxis': 'BOTTOM_AXIS'})
+        del series[target_count:]
         for item in basic.get('domains', []):
             for source in item['domain']['sourceRange']['sources']:
                 source.update(startRowIndex=1, endRowIndex=len(values)-1)
@@ -579,7 +636,7 @@ def sheet_chart_requests(sheet_id, values, existing, preserve_format=False):
         'axis': [{'position': 'BOTTOM_AXIS', 'title': 'Orders'}, {'position': 'LEFT_AXIS', 'title': 'Status'}],
         'domains': [{'domain': source(0)}], 'series': [
             {'series': source(index), 'targetAxis': 'BOTTOM_AXIS', 'color': sheet_color(color)}
-            for index, color in enumerate(('#555555', '#999999', '#cccccc'), 1)]}}
+            for index, color in enumerate(('#555555', '#999999', '#cccccc', '#a8c5ed')[:len(values[1])-2], 1)]}}
     position = {'overlayPosition': {'anchorCell': {'sheetId': sheet_id, 'rowIndex': 1, 'columnIndex': 6},
                                    'widthPixels': 950, 'heightPixels': max(400, (len(values)-3)*32)}}
     if chart:
@@ -597,9 +654,9 @@ def preserve_table_formats(sheet_id, previous, values):
         return []
     def copy(start, end, row):
         return {'copyPaste': {'source': {'sheetId': sheet_id, 'startRowIndex': row,
-                    'endRowIndex': row+1, 'endColumnIndex': 5},
+                    'endRowIndex': row+1, 'endColumnIndex': len(values[1])},
                 'destination': {'sheetId': sheet_id, 'startRowIndex': start,
-                    'endRowIndex': end, 'endColumnIndex': 5}, 'pasteType': 'PASTE_FORMAT'}}
+                    'endRowIndex': end, 'endColumnIndex': len(values[1])}, 'pasteType': 'PASTE_FORMAT'}}
     requests = [copy(new_total, new_total+1, old_total)]
     if old_total >= 3 and new_total > old_total:
         requests.append(copy(old_total, new_total, 2))
@@ -628,7 +685,7 @@ def publish_preview_sla(book, report, backup_root):
             'gridProperties': {'rowCount': len(values)+25}}, 'fields': 'gridProperties.rowCount'}})
     requests.extend(preserve_table_formats(number, previous, values))
     requests.append({'updateCells': {'range': {'sheetId': number,
-        'endRowIndex': max(len(values), len(previous)), 'endColumnIndex': 5},
+        'endRowIndex': max(len(values), len(previous)), 'endColumnIndex': max(len(values[1]), max((len(r) for r in previous), default=0))},
         'rows': [{'values': [sheet_cell(value) for value in row]} for row in values],
         'fields': 'userEnteredValue'}})
     if not existing:
@@ -643,7 +700,7 @@ def publish_preview_sla(book, report, backup_root):
     def normalized(matrix):
         result = []
         for row in matrix:
-            row = [str(value) if value is not None else '' for value in row[:5]]
+            row = [str(value) if value is not None else '' for value in row[:len(values[1])]]
             while row and not row[-1]:
                 row.pop()
             result.append(row)
