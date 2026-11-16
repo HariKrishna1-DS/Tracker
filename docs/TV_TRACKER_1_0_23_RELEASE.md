@@ -2,6 +2,7 @@
 
 Released November 16, 2026.
 
+- Preserves Production Report uploaded ExcelReports, results, folder, selected preview, routing, status overrides, and toggle choices when navigating to Capacity Report and back during the current session. Reloading or restarting starts a new session.
 - Parses day-month-year production dates correctly so weekend completions are included in Friday capacity totals.
 - Moves every Saturday and Sunday completion to the preceding Friday during production Excel updates, including existing weekend Out Times, while retaining the time of day.
 - Supports selecting or dragging multiple Completed ExcelReports, with combined order counts and exclusion of conflicting completion times across files.

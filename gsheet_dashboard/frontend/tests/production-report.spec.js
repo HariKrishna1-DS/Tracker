@@ -118,6 +118,7 @@ test('completion upload is included in checks and shows completion counts and de
   });
   await page.goto('/');
   await page.getByRole('button',{name:'Production Report',exact:true}).click();
+  await page.getByLabel('Production report folder',{exact:true}).fill('C:\\Reports\\Session');
   await page.getByLabel('Upload completed ExcelReport',{exact:true}).setInputFiles({name:'ExcelReport.xlsx',mimeType:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',buffer:Buffer.from('mock upload')});
   await expect(page.getByText('1 files selected · 1 orders with completion times · 0 conflicting orders excluded')).toBeVisible();
   await expect(page.getByText('ExcelReport.xlsx',{exact:true})).toBeVisible();
@@ -126,6 +127,17 @@ test('completion upload is included in checks and shows completion counts and de
   const dialog=page.getByRole('dialog',{name:'Full Search — completion times'});
   await expect(dialog.getByRole('cell',{name:'DONE-1',exact:true})).toBeVisible();
   await expect(dialog.getByRole('cell',{name:'2026-11-11T06:19:29',exact:true})).toBeVisible();
+  await page.keyboard.press('Escape');
+  await page.getByRole('switch',{name:'Status changed',exact:true}).click();
+  await page.getByRole('button',{name:'Capacity Report',exact:true}).click();
+  await page.getByRole('heading',{name:'Capacity Report',exact:true}).waitFor();
+  await page.getByRole('button',{name:'Production Report',exact:true}).click();
+  await expect(page.getByLabel('Production report folder',{exact:true})).toHaveValue('C:\\Reports\\Session');
+  await expect(page.getByLabel('Production report preview',{exact:true})).toHaveValue('32');
+  await expect(page.getByText('ExcelReport.xlsx',{exact:true})).toBeVisible();
+  await expect(page.getByRole('switch',{name:'Status changed',exact:true})).toHaveAttribute('aria-checked','false');
+  await expect(page.getByRole('button',{name:'1 Completion times to update Included View orders',exact:true})).toBeVisible();
+  await page.getByRole('button',{name:'Check folder & orders',exact:true}).click();
   expect(token).toBe('test-token');
 });
 

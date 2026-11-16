@@ -1,4 +1,4 @@
-import React,{useEffect,useMemo,useState} from 'react';
+import React,{useEffect,useMemo,useRef,useState} from 'react';
 import {api} from './workspaceUtils';
 import {Dialog} from './DesktopExperience';
 import {Search,CheckCircle2,Undo2,Pencil,Check,X,AlertTriangle,Upload,FileSpreadsheet} from 'lucide-react';
@@ -11,15 +11,29 @@ function SuccessNotice({title,children}) {
   return <div className="production-success" role="status"><span className="production-success-icon" aria-hidden="true">✅</span><div className="production-success-content"><strong>{title}</strong>{children}</div></div>;
 }
 
-export default function ProductionReport({revision}) {
-  const [folder,setFolder]=useState(''),[previews,setPreviews]=useState([]),[preview,setPreview]=useState('');
+// Keep uploaded tokens and report work in the owning workspace for navigation.
+function useSessionState(session,key,initial) {
+  const [value,setValue]=useState(()=>Object.hasOwn(session.current,key)?session.current[key]:initial);
+  function update(next) {
+    const previous=Object.hasOwn(session.current,key)?session.current[key]:initial;
+    const value=typeof next==='function'?next(previous):next;
+    session.current[key]=value;
+    setValue(value);
+  }
+  return [value,update];
+}
+
+export default function ProductionReport({revision,session}) {
+  const localSession=useRef({});
+  const reportSession=session||localSession;
+  const [folder,setFolder]=useSessionState(reportSession,'folder',''),[previews,setPreviews]=useState([]),[preview,setPreview]=useSessionState(reportSession,'preview','');
   const [detail,setDetail]=useState(null),[detailSearch,setDetailSearch]=useState('');
-  const [restore,setRestore]=useState(null),[confirmRevert,setConfirmRevert]=useState(false),[message,setMessage]=useState('');
-  const [statusOverrides,setStatusOverrides]=useState({}),[customOrder,setCustomOrder]=useState(null),[customStatus,setCustomStatus]=useState('');
+  const [restore,setRestore]=useSessionState(reportSession,'restore',null),[confirmRevert,setConfirmRevert]=useState(false),[message,setMessage]=useSessionState(reportSession,'message','');
+  const [statusOverrides,setStatusOverrides]=useSessionState(reportSession,'statusOverrides',{}),[customOrder,setCustomOrder]=useState(null),[customStatus,setCustomStatus]=useState('');
   const [editingStatus,setEditingStatus]=useState(null),[statusDraft,setStatusDraft]=useState('');
-  const [completionUpload,setCompletionUpload]=useState(null);
+  const [completionUpload,setCompletionUpload]=useSessionState(reportSession,'completionUpload',null);
   const [completionDragging,setCompletionDragging]=useState(false);
-  const [exportOptions,setExportOptions]=useState({new_orders:true,status_changes:true,completion_times:true,completed_tv:true});
+  const [exportOptions,setExportOptions]=useSessionState(reportSession,'exportOptions',{new_orders:true,status_changes:true,completion_times:true,completed_tv:true});
   const anyExport=Object.values(exportOptions).some(Boolean);
   function verifyOptions(data){
     if(data.export_options_version!==1||!data.export_options||Object.keys(exportOptions).some(key=>data.export_options[key]!==exportOptions[key]))
@@ -36,7 +50,7 @@ export default function ProductionReport({revision}) {
       setCompletionUpload(data);invalidate();
     }catch(error){setError(error.message);}finally{setBusy(false);}
   }
-  const [routes,setRoutes]=useState({}),[result,setResult]=useState(null),[busy,setBusy]=useState(false),[error,setError]=useState('');
+  const [routes,setRoutes]=useSessionState(reportSession,'routes',{}),[result,setResult]=useSessionState(reportSession,'result',null),[busy,setBusy]=useState(false),[error,setError]=useSessionState(reportSession,'error','');
   useEffect(()=>{let alive=true;api('/api/production-report').then(data=>{if(alive){setFolder(value=>value||data.folder);setPreviews(data.previews);setRestore(data.revert||null);setPreview(value=>value||String(data.selected_preview_id||data.previews[0]?.id||''));}}).catch(error=>{if(alive)setError(error.message);});return()=>{alive=false;};},[revision]);
   async function run(action){
     setBusy(true);setError('');setMessage('');setDetail(null);setDetailSearch('');
