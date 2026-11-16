@@ -1,7 +1,7 @@
-"""Append-only production workbook workflow. Existing cells are never edited."""
+"""Previewed production workbook additions, status and completion-date updates."""
 from collections import Counter
 from copy import copy
-from datetime import datetime
+from datetime import datetime, timedelta
 from hashlib import sha256
 from io import BytesIO
 import json
@@ -49,6 +49,19 @@ def number(value):
 
 def completed_status(value):
     return norm(str(value or '').replace('&','and')) in ('completed','completedanddelivered')
+
+
+def friday_completion(value):
+    """Keep wall-clock time; move weekend completion dates to the prior Friday."""
+    from monthly_production import local_datetime
+    parsed = local_datetime(value)
+    if parsed and parsed.weekday() >= 5:
+        parsed -= timedelta(days=parsed.weekday()-4)
+    return parsed
+
+
+def out_time_text(value):
+    return value.isoformat() if isinstance(value, datetime) else str(value or '')
 
 
 def protected_status(value):
@@ -120,7 +133,7 @@ def template(path):
     return book, sheet, header_row, headers, existing, products
 
 
-def read_completion_report(data):
+def read_completion_report(data, excluded_orders=None):
     """Read absolute completion timestamps; conflicting duplicates are excluded."""
     book = load_workbook(BytesIO(data), read_only=True, data_only=True)
     values, conflicts, found = {}, set(), False
@@ -146,12 +159,22 @@ def read_completion_report(data):
                 if key in values and values[key] != value: conflicts.add(key)
                 values[key] = value
         if not found: raise ValueError('Upload an ExcelReport with Order Number and Completed Time (hours) columns.')
+        if excluded_orders is not None:
+            excluded_orders.update(conflicts)
         return {key:value for key,value in values.items() if key not in conflicts}, len(conflicts)
     finally:
         book.close()
 
 
-def plan(folder, report, routes=None, comparison_rows=None, status_overrides=None, completion_times=None):
+def plan(folder, report, routes=None, comparison_rows=None, status_overrides=None, completion_times=None, export_options=None):
+    from monthly_production import local_datetime
+    options = dict(new_orders=True, status_changes=True, completion_times=True, completed_tv=False)
+    if export_options is not None:
+        if not isinstance(export_options, dict) or any(key not in options or type(value) is not bool for key, value in export_options.items()):
+            raise ValueError('Invalid export options. Choose On or Off for each update type.')
+        options.update(export_options)
+    if not any(options.values()):
+        raise ValueError('Turn on at least one export option.')
     files = discover(folder)
     info, known = {}, {}
     for kind, path in files.items():
@@ -163,20 +186,42 @@ def plan(folder, report, routes=None, comparison_rows=None, status_overrides=Non
         info[kind] = dict(path=path, sheet=sheet.title, headers=headers, existing=existing,
                           sha256=digest(path), additions=[], changes=[], skipped=0, statuses={number(row[next(i for i,h in enumerate(headers) if norm(h)=='ordernumber')]):str(row[next(i for i,h in enumerate(headers) if norm(h)=='status')] or '') for row in sheet.iter_rows(min_row=hr+1,values_only=True) if row[next(i for i,h in enumerate(headers) if norm(h)=='ordernumber')]})
         info[kind]['protected']=protected
-        times, kept, unmatched = [], 0, 0
+        times, tv_updates, kept, unmatched = [], [], 0, 0
         out_index = next((i for i,h in enumerate(headers) if norm(h)=='outtime'), None)
-        if completion_times is not None:
-            if out_index is None: raise ValueError(f'{path.name}: Out Time column is required for completion updates.')
+        if completion_times is not None and out_index is None and options['completion_times']:
+            raise ValueError(f'{path.name}: Out Time column is required for completion updates.')
+        if out_index is not None:
             for r in range(hr+1, sheet.max_row+1):
                 identity = sheet.cell(r,order_index+1).value
-                if not identity or not completed_status(sheet.cell(r,status_index+1).value): continue
+                previous_status = sheet.cell(r,status_index+1).value
+                if not identity: continue
                 current = sheet.cell(r,out_index+1).value
+                if not completed_status(previous_status):
+                    uploaded = friday_completion((completion_times or {}).get(number(identity)))
+                    if uploaded:
+                        tv_updates.append({'row':r,'Order Number':str(identity),
+                            'PreviousStatus':str(previous_status or ''), 'Status':'Completed and Delivered',
+                            'Previous Out Time':out_time_text(current),
+                            'Out Time':((friday_completion(current) or uploaded).isoformat()
+                                if not out_time_text(current).strip() or friday_completion(current)
+                                else out_time_text(current))})
+                    continue
                 if current is not None and str(current).strip():
-                    kept += 1
-                elif number(identity) in completion_times:
-                    times.append({'row':r,'Order Number':str(identity),'Out Time':completion_times[number(identity)]})
+                    adjusted = friday_completion(current)
+                    if adjusted and adjusted != local_datetime(current):
+                        times.append({'row':r,'Order Number':str(identity),
+                                      'Previous Out Time':out_time_text(current), 'Out Time':adjusted.isoformat()})
+                    else:
+                        kept += 1
+                elif number(identity) in (completion_times or {}):
+                    adjusted = friday_completion(completion_times[number(identity)])
+                    if adjusted:
+                        times.append({'row':r,'Order Number':str(identity),'Out Time':adjusted.isoformat()})
+                    else: unmatched += 1
                 else: unmatched += 1
-        info[kind].update(completion_updates=times, completion_kept=kept, completion_unmatched=unmatched)
+        if out_index is None and options['completed_tv'] and completion_times:
+            raise ValueError(f'{path.name}: Out Time column is required for Completed in TV updates.')
+        info[kind].update(completion_updates=times, completed_tv_updates=tv_updates, completion_kept=kept, completion_unmatched=unmatched)
         for product in products:
             known.setdefault(norm(product), set()).add(kind)
         book.close()
@@ -242,18 +287,36 @@ def plan(folder, report, routes=None, comparison_rows=None, status_overrides=Non
         if norm(status)=='searchinprogress':target['Comments']='New Orders'
         for row in preview:
             if number(row['Order Number'])==number(identity):row['Status']=status.strip()
-    payload = {'preview_id': report.get('preview_id'), 'rows': preview,
+    candidate_reports = [{'kind':k, 'name':v['path'].name, 'sheet':v['sheet'],
+        'existing':len(v['existing']), 'missing':len(v['additions']), 'skipped':v['skipped'],
+        'orders':list(v['additions']), 'status_changed':len(v['changes']), 'changed_orders':list(v['changes']),
+        'completion_count':len(v['completion_updates']), 'completion_orders':list(v['completion_updates']),
+        'completed_tv_count':len(v['completed_tv_updates']), 'completed_tv_orders':list(v['completed_tv_updates']),
+        'completion_kept':v['completion_kept'], 'completion_unmatched':v['completion_unmatched']} for k,v in info.items()]
+    candidate_fingerprint = sha256(json.dumps({'reports':candidate_reports,'rows':preview,
+        'files':{k:v['sha256'] for k,v in info.items()},'unresolved':sorted(unresolved)},sort_keys=True,default=str).encode()).hexdigest()
+    # Disabled changes remain in the source and can be selected on a later check.
+    for item in info.values():
+        if not options['new_orders']: item['additions'] = []
+        if not options['status_changes']: item['changes'] = []
+        if not options['completion_times']: item['completion_updates'] = []
+        if not options['completed_tv']: item['completed_tv_updates'] = []
+    if not options['new_orders']: unresolved.clear()
+    payload = {'export_options': options, 'preview_id': report.get('preview_id'), 'rows': preview,
                'files': {k: v['sha256'] for k,v in info.items()}, 'routes': routes or {},
                'changes': {k:v['changes'] for k,v in info.items()}, 'status_overrides':status_overrides or {},
                'completion_updates':{k:v['completion_updates'] for k,v in info.items()}}
+    payload['completed_tv_updates'] = {k:v['completed_tv_updates'] for k,v in info.items()}
     fingerprint = sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
     return info, dict(fingerprint=fingerprint, preview_id=report.get('preview_id'),
         preview_name=report.get('preview_name'), columns=GOOGLE_COLUMNS,
-        rows=preview, unresolved=sorted(unresolved), products=dict(counts),
+        rows=preview, unresolved=sorted(unresolved), products=dict(counts), export_options=options,
+        export_options_version=1, candidate_reports=candidate_reports, candidate_fingerprint=candidate_fingerprint,
         reports=[{'kind':k, 'name':v['path'].name, 'sheet':v['sheet'],
             'existing':len(v['existing']), 'missing':len(v['additions']), 'skipped':v['skipped'],
             'orders':v['additions'], 'status_changed':len(v['changes']), 'changed_orders':v['changes'],
             'completion_count':len(v['completion_updates']), 'completion_orders':v['completion_updates'],
+            'completed_tv_count':len(v['completed_tv_updates']), 'completed_tv_orders':v['completed_tv_updates'],
             'completion_kept':v['completion_kept'], 'completion_unmatched':v['completion_unmatched']} for k,v in info.items()])
 
 
@@ -294,7 +357,7 @@ def extend_status_formatting(sheet, header_row, headers, end_row):
     sheet.conditional_formatting=updated
 
 
-def append_rows(path, rows, changes=None, completion_updates=None):
+def append_rows(path, rows, changes=None, completion_updates=None, completed_tv_updates=None):
     book, sheet, hr, headers, _, _ = template(path)
     status_col = next(i+1 for i,h in enumerate(headers) if norm(h)=='status')
     updates = {number(row['Order Number']):row['Status'] for row in (changes or [])}
@@ -305,11 +368,25 @@ def append_rows(path, rows, changes=None, completion_updates=None):
         cell = sheet.cell(r,out_col)
         if number(sheet.cell(r,order_col).value) != number(update['Order Number']) or not completed_status(sheet.cell(r,status_col).value):
             raise ValueError('A completed order changed. Check the folder again.')
-        if cell.value is not None and str(cell.value).strip():
-            raise ValueError('An Out Time was filled since checking. Check the folder again.')
+        if out_time_text(cell.value).strip() != update.get('Previous Out Time', '').strip():
+            raise ValueError('An Out Time changed since checking. Check the folder again.')
         cell.value = datetime.fromisoformat(update['Out Time'])
         if not is_date_format(cell.number_format): cell.number_format = 'mm/dd/yyyy hh:mm:ss AM/PM'
     # Recheck the actual workbook at write time, independently of the saved comparison.
+    for update in completed_tv_updates or []:
+        r = update['row']
+        if (number(sheet.cell(r,order_col).value) != number(update['Order Number'])
+                or str(sheet.cell(r,status_col).value or '') != update['PreviousStatus']
+                or out_time_text(sheet.cell(r,out_col).value) != update['Previous Out Time']):
+            raise ValueError('A Completed in TV order changed. Check the folder again.')
+        sheet.cell(r,status_col).value = 'Completed and Delivered'
+        cell = sheet.cell(r,out_col)
+        # Preserve an existing nonblank date unless it is a weekend date.
+        adjusted = friday_completion(cell.value)
+        from monthly_production import local_datetime
+        if not out_time_text(cell.value).strip() or (adjusted and adjusted != local_datetime(cell.value)):
+            cell.value = datetime.fromisoformat(update['Out Time'])
+            if not is_date_format(cell.number_format): cell.number_format = 'dd-mm-yyyy hh:mm:ss'
     protected={number(sheet.cell(r,order_col).value) for r in range(hr+1,sheet.max_row+1)
                if protected_status(sheet.cell(r,status_col).value)}
     for existing_row in range(hr+1, sheet.max_row+1):
@@ -357,6 +434,11 @@ def append_rows(path, rows, changes=None, completion_updates=None):
                 if parsed_date is not None:
                     value=parsed_date
                     if not is_date_format(cell.number_format): cell.number_format='dd-mm-yyyy'
+            if norm(header)=='outtime' and completed_status(source.get('Status')) and value not in (None,''):
+                adjusted=friday_completion(value)
+                if adjusted is not None:
+                    value=adjusted
+                    if not is_date_format(cell.number_format): cell.number_format='dd-mm-yyyy hh:mm:ss'
             if norm(header) in ('comments','comment','etacomments'):
                 value = plain_comment(value)
             if not value and previous.data_type=='f':
@@ -378,7 +460,7 @@ def append_rows(path, rows, changes=None, completion_updates=None):
     return stream.getvalue()
 
 
-def proceed(info, output):
+def proceed(info, output, export_options=None):
     """Stage both files, verify no external edits, back up, then replace with rollback."""
     output.mkdir(parents=True, exist_ok=False)
     staged, backups, replaced = {}, {}, []
@@ -387,8 +469,13 @@ def proceed(info, output):
             path=item['path']
             if path.with_name('~$'+path.name).exists():
                 raise ValueError(f'Close {path.name} in Excel before proceeding.')
-            changed = item['additions'] or item.get('changes') or item.get('completion_updates')
-            data=append_rows(path,item['additions'],item.get('changes'),item.get('completion_updates')) if changed else path.read_bytes()
+            options = export_options if export_options is not None else dict(new_orders=True,status_changes=True,completion_times=True)
+            additions = item['additions'] if options.get('new_orders') is True else []
+            changes = item.get('changes') if options.get('status_changes') is True else []
+            completions = item.get('completion_updates') if options.get('completion_times') is True else []
+            tv_updates = item.get('completed_tv_updates') if options.get('completed_tv') is True else []
+            changed = additions or changes or completions or tv_updates
+            data=append_rows(path,additions,changes,completions,tv_updates) if changed else path.read_bytes()
             (output/path.name).write_bytes(data)
             if changed:
                 temporary=path.with_name('.tv-tracker-'+uuid4().hex+'.xlsx')
@@ -476,18 +563,30 @@ def register_production_export(app, workspace, load_report):
 
     @app.post('/api/production-report/completion-upload')
     def completion_upload():
-        upload = request.files.get('file')
-        if not upload or not upload.filename.lower().endswith('.xlsx'):
-            return jsonify(error='Choose an ExcelReport .xlsx file.'),400
+        # Allow the advertised batch size without enlarging other upload routes.
+        request.max_content_length = 101 * 1024 * 1024
+        uploads = request.files.getlist('files') or request.files.getlist('file')
+        if not 1 <= len(uploads) <= 30 or any(not upload.filename.lower().endswith('.xlsx') for upload in uploads):
+            return jsonify(error='Choose between 1 and 30 ExcelReport .xlsx files.'),400
         try:
-            data = upload.read(20*1024*1024+1)
-            if len(data)>20*1024*1024: raise ValueError('The completion report must be at most 20 MB.')
-            times, conflicts = read_completion_report(data)
+            times, excluded, names, total_bytes = {}, set(), [], 0
+            for upload in uploads:
+                data = upload.read(20*1024*1024+1)
+                total_bytes += len(data)
+                if len(data)>20*1024*1024 or total_bytes>100*1024*1024:
+                    return jsonify(error='Each report must be at most 20 MB; the combined upload must be at most 100 MB.'),400
+                values, _ = read_completion_report(data, excluded)
+                for key, value in values.items():
+                    if key in times and times[key] != value:
+                        excluded.add(key)
+                    times[key] = value
+                names.append(Path(upload.filename).name)
+            times = {key:value for key,value in times.items() if key not in excluded}
             token = uuid4().hex
             directory = exports/'completion-uploads'
             directory.mkdir(parents=True,exist_ok=True)
             (directory/(token+'.json')).write_text(json.dumps(times))
-            return jsonify(token=token,name=Path(upload.filename).name,orders=len(times),conflicts=conflicts)
+            return jsonify(token=token,name=', '.join(names),names=names,files=len(names),orders=len(times),conflicts=len(excluded))
         except Exception:
             return jsonify(error='Could not read the completion report. Use a valid .xlsx file with Order Number and Completed Time (hours) columns.'),400
 
@@ -524,13 +623,13 @@ def register_production_export(app, workspace, load_report):
                     source = exports/'completion-uploads'/(token+'.json')
                     if not source.is_file(): raise ValueError('Upload the completion report again.')
                     completion_times = json.loads(source.read_text())
-                info,result=plan(body.get('folder',''),report,body.get('routes'), saved_comparison.get('rows') or None, body.get('status_overrides'), completion_times)
+                info,result=plan(body.get('folder',''),report,body.get('routes'), saved_comparison.get('rows') or None, body.get('status_overrides'), completion_times, body.get('export_options'))
                 if action=='proceed':
                     if result['unresolved']: raise ValueError('Choose destinations for all unfamiliar products, then check again.')
                     if body.get('fingerprint')!=result['fingerprint']:
                         return jsonify(error='The preview, routing or workbooks changed. Check again before proceeding.'),409
                     token=uuid4().hex
-                    backups=proceed(info,exports/token)
+                    backups=proceed(info,exports/token,result['export_options'])
                     result.update(completed=True,backups=backups,downloads=[{'name':v['path'].name,
                         'url':f'/api/production-report/download/{token}/{kind}'} for kind,v in info.items()])
                     (exports/token/'files.json').write_text(json.dumps({k:v['path'].name for k,v in info.items()}))

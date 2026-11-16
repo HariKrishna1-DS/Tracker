@@ -40,6 +40,50 @@ class ProductionExportTests(unittest.TestCase):
         self.assertEqual(book.active.cell(2,8).value,'SearchFix')
         book.close()
 
+    def test_export_switches_apply_only_enabled_categories_and_leave_others_for_later(self):
+        for kind,path in self.files.items():
+            book=load_workbook(path)
+            book.active.cell(1,14,'Out Time')
+            if kind=='co': book.active.cell(2,8,'Assign to ABS')
+            book.save(path);book.close()
+        self.report['rows'].append({'Order Number':'co-old','Product':'Update','Status':'SearchFix'})
+        self.report['summary']=[{'Status':'Assign to ABS'},{'Status':'SearchFix'},{'Status':'Search In Progress'}]
+        snapshot=[{'order_number':'co-old','status':'Assign to ABS','product':'Update'}]
+        originals={kind:path.read_bytes() for kind,path in self.files.items()}
+        times={'full-old':'2026-11-11T06:19:29'}
+        fingerprints=set()
+        for mask in range(1,8):
+            options=dict(new_orders=bool(mask&1),status_changes=bool(mask&2),completion_times=bool(mask&4))
+            with self.subTest(options=options):
+                for kind,path in self.files.items():path.write_bytes(originals[kind])
+                info,result=plan(self.root,self.report,comparison_rows=snapshot,completion_times=times,export_options=options)
+                fingerprints.add(result['fingerprint'])
+                self.assertEqual(sum(r['missing'] for r in result['candidate_reports']),2)
+                self.assertEqual(sum(r['status_changed'] for r in result['candidate_reports']),1)
+                self.assertEqual(sum(r['completion_count'] for r in result['candidate_reports']),1)
+                self.assertEqual(sum(r['missing'] for r in result['reports']),2 if options['new_orders'] else 0)
+                self.assertEqual(sum(r['status_changed'] for r in result['reports']),int(options['status_changes']))
+                self.assertEqual(sum(r['completion_count'] for r in result['reports']),int(options['completion_times']))
+                proceed(info,self.root/f'options-{mask}')
+                for kind,path in self.files.items():
+                    book=load_workbook(path);sheet=book.active
+                    self.assertEqual(sheet.max_row,3 if options['new_orders'] else 2)
+                    if kind=='co': self.assertEqual(sheet.cell(2,8).value,'SearchFix' if options['status_changes'] else 'Assign to ABS')
+                    if kind=='full': self.assertEqual(sheet.cell(2,14).value,datetime(2026,11,11,6,19,29) if options['completion_times'] else None)
+                    book.close()
+                _,later=plan(self.root,self.report,comparison_rows=snapshot,completion_times=times)
+                self.assertEqual(sum(r['missing'] for r in later['reports']),0 if options['new_orders'] else 2)
+                self.assertEqual(sum(r['completion_count'] for r in later['reports']),0 if options['completion_times'] else 1)
+        self.assertEqual(len(fingerprints),7)
+
+    def test_completion_only_ignores_unknown_product_routing_and_rejects_invalid_options(self):
+        self.report['rows'].append({'Order Number':'unknown','Product':'Unknown product','Status':'SearchFix'})
+        _,result=plan(self.root,self.report,export_options={'new_orders':False,'status_changes':False})
+        self.assertEqual(result['unresolved'],[])
+        for options in ({'new_orders':False,'status_changes':False,'completion_times':False},{'new_orders':'false'},{'unknown':True},[]):
+            with self.subTest(options=options):
+                with self.assertRaises(ValueError):plan(self.root,self.report,export_options=options)
+
     def test_status_changes_exclude_production_only_labels(self):
         self.report['summary']=[{'Status':'Assign to ABS'},{'Status':'Search In Progress'},
                                 {'Status':'Awaiting for Clarification'},{'Status':'SearchFix'}]
@@ -84,6 +128,121 @@ class ProductionExportTests(unittest.TestCase):
         times,conflicts=read_completion_report(stream.getvalue())
         self.assertEqual(times,{'a':'2026-11-11T06:19:29'})
         self.assertEqual(conflicts,1)
+
+    def test_completed_tv_only_matches_uploaded_orders_and_updates_both_reports_with_revert(self):
+        from production_export import revert_checkpoint, revert_excel
+        for kind,path in self.files.items():
+            book=load_workbook(path);sheet=book.active
+            sheet.cell(1,14,'Out Time')
+            sheet.cell(2,8,'Need to assign ABS' if kind=='co' else 'QC in Progress')
+            sheet.append([2,None,'unmatched',None,None,None,'Update','Search In Progress'])
+            book.save(path);book.close()
+        before={kind:path.read_bytes() for kind,path in self.files.items()}
+        times={'full-old':'2026-11-07T08:30:00','co-old':'2026-11-08T15:45:00','not-in-production':'2026-11-06'}
+        options=dict(new_orders=False,status_changes=False,completion_times=False,completed_tv=True)
+        info,result=plan(self.root,self.report,completion_times=times,export_options=options)
+        self.assertEqual([r['completed_tv_count'] for r in result['reports']],[1,1])
+        self.assertEqual(sum(r['missing']+r['status_changed']+r['completion_count'] for r in result['reports']),0)
+        self.assertEqual({kind:path.read_bytes() for kind,path in self.files.items()},before)
+        output=self.root/'exports'/('c'*32)
+        proceed(info,output,options)
+        for kind,path in self.files.items():
+            book=load_workbook(path);sheet=book.active
+            self.assertEqual(sheet.cell(2,8).value,'Completed and Delivered')
+            self.assertEqual(sheet.cell(2,14).value,datetime(2026,11,6,8,30) if kind=='full' else datetime(2026,11,6,15,45))
+            self.assertEqual(sheet.cell(3,8).value,'Search In Progress')
+            self.assertEqual(sheet.max_row,3)
+            book.close()
+        _,after=plan(self.root,self.report,completion_times=times,export_options=options)
+        self.assertEqual(sum(r['completed_tv_count'] for r in after['reports']),0)
+        (output/'files.json').write_text(__import__('json').dumps({k:p.name for k,p in self.files.items()}))
+        revert_excel(revert_checkpoint(self.root,self.root/'exports'))
+        self.assertEqual({kind:path.read_bytes() for kind,path in self.files.items()},before)
+
+    def test_completed_tv_off_keeps_candidate_rows_without_writing_them(self):
+        book=load_workbook(self.files['co']);book.active.cell(1,14,'Out Time');book.save(self.files['co']);book.close()
+        path=self.files['full'];book=load_workbook(path)
+        book.active.cell(1,14,'Out Time');book.active.cell(2,8,'Typing in Progress')
+        book.active.cell(2,14,datetime(2026,11,5,10))
+        book.save(path);book.close()
+        times={'full-old':'2026-11-07T08:30:00'}
+        options=dict(new_orders=False,status_changes=False,completion_times=True,completed_tv=False)
+        info,result=plan(self.root,self.report,completion_times=times,export_options=options)
+        self.assertEqual(sum(r['completed_tv_count'] for r in result['candidate_reports']),1)
+        self.assertEqual(sum(r['completed_tv_count'] for r in result['reports']),0)
+        self.assertEqual(info['full']['completed_tv_updates'],[])
+        proceed(info,self.root/'tv-disabled',options)
+        book=load_workbook(path)
+        self.assertEqual(book.active.cell(2,8).value,'Typing in Progress')
+        self.assertEqual(book.active.cell(2,14).value,datetime(2026,11,5,10));book.close()
+        options['completed_tv']=True
+        info,_=plan(self.root,self.report,completion_times=times,export_options=options)
+        self.assertEqual(info['full']['completed_tv_updates'][0]['Out Time'],'2026-11-05T10:00:00')
+        proceed(info,self.root/'tv-enabled',options)
+        book=load_workbook(path)
+        self.assertEqual(book.active.cell(2,8).value,'Completed and Delivered')
+        self.assertEqual(book.active.cell(2,14).value,datetime(2026,11,5,10));book.close()
+
+    def test_weekend_completion_sync_corrects_existing_and_uploaded_dates_and_capacity(self):
+        from report_workspace import read_report_files, imported_snapshot, capacity_report
+        from production_export import revert_checkpoint, revert_excel
+        for kind,path in self.files.items():
+            book=load_workbook(path);sheet=book.active
+            sheet.cell(1,14,'Out Time')
+            if kind=='co': sheet.cell(2,14,'07-11-2026')
+            book.save(path);book.close()
+        before={kind:path.read_bytes() for kind,path in self.files.items()}
+        options=dict(new_orders=False,status_changes=False,completion_times=True)
+        info,result=plan(self.root,self.report,completion_times={'full-old':'2026-11-08T17:23:41'},export_options=options)
+        self.assertEqual(sum(r['completion_count'] for r in result['reports']),2)
+        self.assertEqual(info['co']['completion_updates'][0]['Previous Out Time'],'07-11-2026')
+        self.assertEqual(info['co']['completion_updates'][0]['Out Time'],'2026-11-06T00:00:00')
+        output=self.root/'exports'/('b'*32)
+        proceed(info,output)
+        for kind,path in self.files.items():
+            book=load_workbook(path)
+            self.assertEqual(book.active.cell(2,14).value,datetime(2026,11,6,17,23,41) if kind=='full' else datetime(2026,11,6))
+            book.close()
+        imported=read_report_files([(p.name,p.read_bytes()) for p in self.files.values()])
+        report=capacity_report(imported_snapshot(imported)['reports'],{'mode':'excel','capacity_month':'2026-11'})
+        self.assertEqual([(r['Date'],r['Completed']) for r in report['daily'] if r['Completed']],[('2026-11-06',2)])
+        _,again=plan(self.root,self.report,completion_times={},export_options=options)
+        self.assertEqual(sum(r['completion_count'] for r in again['reports']),0)
+        (output/'files.json').write_text(__import__('json').dumps({k:p.name for k,p in self.files.items()}))
+        revert_excel(revert_checkpoint(self.root,self.root/'exports'))
+        self.assertEqual({kind:path.read_bytes() for kind,path in self.files.items()},before)
+
+    def test_weekend_corrections_respect_switch_and_preserve_weekday_and_active_orders(self):
+        for kind,path in self.files.items():
+            book=load_workbook(path);sheet=book.active
+            sheet.cell(1,14,'Out Time');sheet.cell(2,14,datetime(2026,11,7,9,30))
+            if kind=='co': sheet.cell(2,8,'Search In Progress')
+            sheet.append([2,None,'weekday',None,None,None,'Update','Completed and delivered'])
+            sheet.cell(3,14,'06-11-2026')
+            book.save(path);book.close()
+        options=dict(new_orders=False,status_changes=True,completion_times=False)
+        info,result=plan(self.root,self.report,export_options=options)
+        self.assertEqual(sum(r['completion_count'] for r in result['candidate_reports']),1)
+        self.assertEqual(sum(r['completion_count'] for r in result['reports']),0)
+        proceed(info,self.root/'disabled-weekend')
+        for path in self.files.values():
+            book=load_workbook(path)
+            self.assertEqual(book.active.cell(2,14).value,datetime(2026,11,7,9,30))
+            self.assertEqual(book.active.cell(3,14).value,'06-11-2026')
+            book.close()
+
+    def test_weekend_completion_boundaries_and_stale_plan(self):
+        from production_export import friday_completion, append_rows
+        for value,expected in [('01-11-2026','2026-10-30'),('02-01-2027','2027-01-01'),('03-01-2027','2027-01-01')]:
+            self.assertEqual(friday_completion(value).date().isoformat(),expected)
+        path=self.files['full'];book=load_workbook(path)
+        book.active.cell(1,14,'Out Time');book.active.cell(2,14,'08-11-2026')
+        book.save(path);book.close()
+        info,_=plan(self.root,self.report)
+        updates=info['full']['completion_updates']
+        book=load_workbook(path);book.active.cell(2,14,'09-11-2026');book.save(path);book.close()
+        with self.assertRaisesRegex(ValueError,'Out Time changed'):
+            append_rows(path,[],completion_updates=updates)
 
     def test_completion_times_fill_only_blank_completed_rows_and_revert(self):
         from production_export import revert_checkpoint,revert_excel
@@ -383,6 +542,57 @@ class ProductionExportTests(unittest.TestCase):
         for kind,path in self.files.items():self.assertEqual(path.read_bytes(),originals[kind])
         self.assertIsNone(client.get('/api/production-report').json['revert'])
         self.assertEqual(client.post('/api/production-report/revert',json={'folder':str(self.root),'token':restore['token']}).status_code,409)
+
+    def test_api_completion_only_preserves_order_rows_and_statuses_in_files_and_downloads(self):
+        from flask import Flask
+        from types import SimpleNamespace
+        from production_export import register_production_export
+        for kind,path in self.files.items():
+            book=load_workbook(path);book.active.cell(1,14,'Out Time')
+            if kind=='co':book.active.cell(2,8,'Assign to ABS')
+            book.save(path);book.close()
+        self.report['rows'].append({'Order Number':'co-old','Product':'Update','Status':'SearchFix'})
+        self.report['summary']=[{'Status':'Assign to ABS'},{'Status':'SearchFix'},{'Status':'Search In Progress'}]
+        settings={'sla_comparison_report':{'rows':[{'order_number':'co-old','status':'Assign to ABS','product':'Update'}]}}
+        store=SimpleNamespace(root=self.root/'previews',list=lambda:[{'id':1,'name':'preview1'}])
+        workspace=SimpleNamespace(store=store,read=lambda:settings,save=lambda **values:settings.update(values))
+        app=Flask(__name__);register_production_export(app,workspace,lambda preview_id:self.report)
+        client=app.test_client()
+        completion=Workbook();completion.active.append(['Order Number','Completed Time (hours)'])
+        completion.active.append(['full-old','11/11/2026 6:19:29 AM'])
+        stream=BytesIO();completion.save(stream);completion.close();stream.seek(0)
+        upload=client.post('/api/production-report/completion-upload',data={'file':(stream,'ExcelReport.xlsx')})
+        self.assertEqual(upload.status_code,200,upload.json)
+        body={'folder':str(self.root),'preview_id':1,'completion_token':upload.json['token']}
+        initial=client.post('/api/production-report/check',json=body).json
+        body['export_options']={'new_orders':False,'status_changes':False,'completion_times':True}
+        # A checked all-categories plan cannot be used with changed switches.
+        body['fingerprint']=initial['fingerprint']
+        self.assertEqual(client.post('/api/production-report/proceed',json=body).status_code,409)
+        checked=client.post('/api/production-report/check',json=body).json
+        self.assertEqual(initial['candidate_fingerprint'],checked['candidate_fingerprint'])
+        self.assertEqual(checked['export_options'],dict(body['export_options'],completed_tv=False))
+        self.assertEqual(sum(r['missing'] for r in checked['candidate_reports']),2)
+        body['fingerprint']=checked['fingerprint']
+        result=client.post('/api/production-report/proceed',json=body)
+        self.assertEqual(result.status_code,200,result.json)
+        self.assertEqual(sum(r['missing'] for r in result.json['reports']),0)
+        self.assertEqual(sum(r['status_changed'] for r in result.json['reports']),0)
+        self.assertEqual(sum(r['completion_count'] for r in result.json['reports']),1)
+        for file in result.json['downloads']:
+            response=client.get(file['url']);book=load_workbook(BytesIO(response.data))
+            sheet=book.active
+            self.assertEqual(sheet.max_row,2)
+            if 'Full Search' in file['name']:
+                self.assertEqual(sheet.cell(2,8).value,'Completed and delivered')
+                self.assertEqual(sheet.cell(2,14).value,datetime(2026,11,11,6,19,29))
+            else:self.assertEqual(sheet.cell(2,8).value,'Assign to ABS')
+            book.close();response.close()
+        for kind,path in self.files.items():
+            book=load_workbook(path)
+            self.assertEqual(book.active.max_row,2)
+            self.assertEqual(book.active.cell(2,8).value,'Assign to ABS' if kind=='co' else 'Completed and delivered')
+            book.close()
 
     def checkpoint(self):
         from production_export import revert_checkpoint
