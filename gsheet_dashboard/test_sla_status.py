@@ -71,6 +71,20 @@ class SlaStatusTests(unittest.TestCase):
         self.assertEqual(report['rows'][0]['SLA Category'], 'Today SLA')
         self.assertEqual(report['totals']['Future SLA'], 0)
 
+    def test_positive_queue_countdown_stays_today_across_the_ist_day_boundary(self):
+        snapshot = {'updated_at': '2026-11-19T12:19:43+05:30', 'report_scope': 'preview',
+                    'sla_reference_at': '2026-11-18T23:10:00', 'sheets': {'Overview': {'rows': [
+                        {'Order Number': 'positive', 'SLA Expiration*': '7h 10m',
+                         'SLA Expiration': '2026-11-19 07:59:43'},
+                        {'Order Number': 'negative', 'SLA Expiration*': '-4h 54m'},
+                        {'Order Number': 'future', 'SLA Expiration*': '11/20 12:59 PM'},
+                    ], 'columns': []}}}
+        report = build_sla_status(snapshot)
+        self.assertEqual(report['as_of'], '2026-11-19')
+        self.assertEqual({row['Order Number']: row['SLA Category'] for row in report['rows']}, {
+            'positive': 'Today SLA', 'negative': 'Negative SLA', 'future': 'Future SLA',
+        })
+
     def test_summary_download_and_exclusions_reconcile(self):
         report = build_sla_status(self.snapshot, self.today)
         self.assertEqual(report['totals'], dict(Status='Grand Total', **{'Future SLA': 1, 'Negative SLA': 1, 'Today SLA': 1, 'Grand Total': 3}))
