@@ -1115,8 +1115,29 @@ def register_report_routes(app, workspace, gate, load_snapshot, get_book, invali
                 pass
         return dict(build_sla_status(snapshot), sync_error=settings.get('sla_sync_error'))
 
+    def refresh_exported_workbooks(paths):
+        with workspace.lock:
+            previous = workspace.read().get('imported')
+            sources = import_sources(previous)
+            names = {source['name'].casefold() for source in sources if not source.get('legacy')}
+            uploads = [(path.name, path.read_bytes()) for path in paths if path.name.casefold() in names]
+            if not uploads:
+                return []
+            updated = read_report_files(uploads)
+            replacements = {source['name'].casefold(): source for source in updated['sources']}
+            next_sources = [replacements.get(source['name'].casefold(), source) for source in sources]
+            if next_sources == sources:
+                return []
+            imported = preserve_sheet_edits(previous, combine_sources(next_sources))
+            workspace.save(imported=imported, files=imported['files'], row_count=len(imported['rows']),
+                           imported_at=imported['created'], cloud_baseline=None, cloud_reset=True,
+                           cloud_refresh_error=None)
+        invalidate()
+        queue_publication()
+        return [name for name, _ in uploads]
+
     from production_export import register_production_export
-    register_production_export(app, workspace, load_preview_sla_report)
+    register_production_export(app, workspace, load_preview_sla_report, refresh_exported_workbooks)
 
     def publish_selected_sla(report):
         from sla_status import publish_preview_sla

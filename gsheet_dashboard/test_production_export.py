@@ -545,21 +545,31 @@ class ProductionExportTests(unittest.TestCase):
 
     def test_api_completion_only_preserves_order_rows_and_statuses_in_files_and_downloads(self):
         from flask import Flask
-        from types import SimpleNamespace
-        from production_export import register_production_export
+        from preview_store import PreviewStore
+        from report_workspace import ReportWorkspace, register_report_routes
+        from threading import Lock
         for kind,path in self.files.items():
             book=load_workbook(path);book.active.cell(1,14,'Out Time')
             if kind=='co':book.active.cell(2,8,'Assign to ABS')
             book.save(path);book.close()
         self.report['rows'].append({'Order Number':'co-old','Product':'Update','Status':'SearchFix'})
         self.report['summary']=[{'Status':'Assign to ABS'},{'Status':'SearchFix'},{'Status':'Search In Progress'}]
-        settings={'sla_comparison_report':{'rows':[{'order_number':'co-old','status':'Assign to ABS','product':'Update'}]}}
-        store=SimpleNamespace(root=self.root/'previews',list=lambda:[{'id':1,'name':'preview1'}])
-        workspace=SimpleNamespace(store=store,read=lambda:settings,save=lambda **values:settings.update(values))
-        app=Flask(__name__);register_production_export(app,workspace,lambda preview_id:self.report)
+        workspace=ReportWorkspace(PreviewStore(self.root/'previews'))
+        workspace.save(sla_comparison_report={'rows':[{'order_number':'co-old','status':'Assign to ABS','product':'Update'}]})
+        app=Flask(__name__)
+        register_report_routes(app,workspace,Lock(),None,None,lambda:None)
+        for name,value in [('preview_snapshot',{'uses_queue_status':False}),('build_sla_status',self.report)]:
+            mock=patch(f'sla_status.{name}',return_value=value)
+            mock.start()
+            self.addCleanup(mock.stop)
         client=app.test_client()
+        imported=client.post('/api/report-import',data={'files':[
+            (BytesIO(path.read_bytes()),path.name) for path in self.files.values()]})
+        self.assertEqual(imported.status_code,201,imported.json)
+        before=client.get('/api/capacity-report/details?month=2026-11&aggregate=true').json
+        self.assertEqual(before['counts']['Completed'],0)
         completion=Workbook();completion.active.append(['Order Number','Completed Time (hours)'])
-        completion.active.append(['full-old','11/11/2026 6:19:29 AM'])
+        completion.active.append(['full-old','11/11/2026 6:19:29 PM'])
         stream=BytesIO();completion.save(stream);completion.close();stream.seek(0)
         upload=client.post('/api/production-report/completion-upload',data={'file':(stream,'ExcelReport.xlsx')})
         self.assertEqual(upload.status_code,200,upload.json)
@@ -579,13 +589,16 @@ class ProductionExportTests(unittest.TestCase):
         self.assertEqual(sum(r['missing'] for r in result.json['reports']),0)
         self.assertEqual(sum(r['status_changed'] for r in result.json['reports']),0)
         self.assertEqual(sum(r['completion_count'] for r in result.json['reports']),1)
+        self.assertEqual(result.json['refreshed_imports'],[self.files['full'].name,self.files['co'].name])
+        after=client.get('/api/capacity-report/details?date=2026-11-12').json
+        self.assertEqual(after['counts']['Completed'],1)
         for file in result.json['downloads']:
             response=client.get(file['url']);book=load_workbook(BytesIO(response.data))
             sheet=book.active
             self.assertEqual(sheet.max_row,2)
             if 'Full Search' in file['name']:
                 self.assertEqual(sheet.cell(2,8).value,'Completed and delivered')
-                self.assertEqual(sheet.cell(2,14).value,datetime(2026,11,11,6,19,29))
+                self.assertEqual(sheet.cell(2,14).value,datetime(2026,11,12,5,49,29))
             else:self.assertEqual(sheet.cell(2,8).value,'Assign to ABS')
             book.close();response.close()
         for kind,path in self.files.items():
@@ -593,6 +606,10 @@ class ProductionExportTests(unittest.TestCase):
             self.assertEqual(book.active.max_row,2)
             self.assertEqual(book.active.cell(2,8).value,'Assign to ABS' if kind=='co' else 'Completed and delivered')
             book.close()
+        reverted=client.post('/api/production-report/revert',json={'folder':str(self.root),'token':result.json['revert']['token']})
+        self.assertEqual(reverted.status_code,200,reverted.json)
+        restored=client.get('/api/capacity-report/details?month=2026-11&aggregate=true').json
+        self.assertEqual(restored['counts']['Completed'],0)
 
     def checkpoint(self):
         from production_export import revert_checkpoint

@@ -23,7 +23,7 @@ function useSessionState(session,key,initial) {
   return [value,update];
 }
 
-export default function ProductionReport({revision,session}) {
+export default function ProductionReport({revision,session,onImportsUpdated}) {
   const localSession=useRef({});
   const reportSession=session||localSession;
   const [folder,setFolder]=useSessionState(reportSession,'folder',''),[previews,setPreviews]=useState([]),[preview,setPreview]=useSessionState(reportSession,'preview','');
@@ -68,6 +68,8 @@ export default function ProductionReport({revision,session}) {
       setRestore(data.revert||null);
       if(action==='revert'){setResult(null);setStatusOverrides({});setConfirmRevert(false);setMessage(data.message);}
       else setResult(data);
+      if(data.refreshed_imports?.length)onImportsUpdated?.();
+      if(data.import_refresh_warning)setError(data.import_refresh_warning);
     }
     catch(error){setError(error.message);}
     finally{setBusy(false);}
@@ -103,7 +105,7 @@ export default function ProductionReport({revision,session}) {
       <label>Production report folder<input aria-label="Production report folder" placeholder={'C:\\Users\\Harikrishna\\Desktop\\PR'} value={folder} disabled={busy} onChange={event=>{setFolder(event.target.value);invalidate();}}/></label>
       <p className="muted">Paste the folder containing one C-O and Update workbook and one Full Search workbook. Local folders and accessible network paths are supported.</p>
       <label>Source preview<select aria-label="Production report preview" value={preview} disabled={busy} onChange={event=>{setPreview(event.target.value);invalidate();}}><option value="" disabled>Choose a saved preview</option>{previews.map(item=><option key={item.id} value={item.id}>{item.name} · {item.row_count} captured rows</option>)}</select></label>
-      <div className={`production-completion-upload${completionDragging?' is-dragging':''}`} onDragOver={event=>{event.preventDefault();event.dataTransfer.dropEffect=busy?'none':'copy';if(!busy)setCompletionDragging(true);}} onDragLeave={event=>{if(!event.currentTarget.contains(event.relatedTarget))setCompletionDragging(false);}} onDrop={event=>{event.preventDefault();setCompletionDragging(false);uploadCompletion(event.dataTransfer.files);}} aria-busy={busy}><FileSpreadsheet size={30} aria-hidden="true"/><h3>Completed ExcelReports</h3><p className="muted">Drag and drop multiple ExcelReports here, or choose files below to fill missing Out Times.</p><label className="production-upload-button"><Upload size={18} aria-hidden="true"/><span>{completionUpload?'Replace ExcelReports':'Upload multiple files'}</span><input type="file" multiple accept=".xlsx" aria-label="Upload completed ExcelReport" disabled={busy} onChange={event=>{uploadCompletion(event.target.files);event.target.value='';}}/></label>
+      <div className={`production-completion-upload${completionDragging?' is-dragging':''}`} onDragOver={event=>{event.preventDefault();event.dataTransfer.dropEffect=busy?'none':'copy';if(!busy)setCompletionDragging(true);}} onDragLeave={event=>{if(!event.currentTarget.contains(event.relatedTarget))setCompletionDragging(false);}} onDrop={event=>{event.preventDefault();setCompletionDragging(false);uploadCompletion(event.dataTransfer.files);}} aria-busy={busy}><FileSpreadsheet size={30} aria-hidden="true"/><h3>Completed ExcelReports</h3><p className="muted">Upload ExcelReports to fill missing Out Times. TitleVision completion times are converted from U.S. Central to India time before applying the Friday rollover.</p><label className="production-upload-button"><Upload size={18} aria-hidden="true"/><span>{completionUpload?'Replace ExcelReports':'Upload multiple files'}</span><input type="file" multiple accept=".xlsx" aria-label="Upload completed ExcelReport" disabled={busy} onChange={event=>{uploadCompletion(event.target.files);event.target.value='';}}/></label>
       <p className="muted">Up to 30 .xlsx files · 20 MB per file · 100 MB total. A new upload replaces the selected batch.</p>
 
       {completionUpload&&<div className="production-upload-summary" role="status"><p>{completionUpload.files||1} files selected · {completionUpload.orders} orders with completion times · {completionUpload.conflicts} conflicting orders excluded</p><ul>{(completionUpload.names||[completionUpload.name]).map((name,index)=><li key={`${index}-${name}`}>{name}</li>)}</ul><button type="button" className="secondary" disabled={busy} onClick={()=>{setCompletionUpload(null);invalidate();}}>Remove completion reports</button></div>}

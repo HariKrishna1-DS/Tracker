@@ -19,7 +19,8 @@ from openpyxl.styles.numbers import is_date_format
 from openpyxl.formatting.formatting import ConditionalFormattingList
 from openpyxl.worksheet.cell_range import CellRange, MultiCellRange
 from new_order_report import plain_comment
-from portal_time import capture_time
+from indian_clock import IST
+from portal_time import PORTAL_TIMEZONE, capture_time
 
 LOCK = threading.Lock()
 GOOGLE_COLUMNS = ['No', 'Date', 'Order Number', 'TraceQ Id', 'State', 'County', 'Client',
@@ -557,9 +558,18 @@ def revert_excel(checkpoint):
         for temp in staged.values(): temp.unlink(missing_ok=True)
 
 
-def register_production_export(app, workspace, load_report):
+def register_production_export(app, workspace, load_report, refresh_workbooks=None):
     from flask import request, jsonify, send_file
     exports = workspace.store.root.parent/'production-exports'
+
+    def refresh_imports(paths):
+        if refresh_workbooks is None:
+            return {}
+        try:
+            return {'refreshed_imports': refresh_workbooks(paths)}
+        except (ValueError, OSError):
+            app.logger.exception('Could not refresh imported production workbooks')
+            return {'import_refresh_warning': 'Excel was saved. Re-import the production workbooks to refresh the Capacity Report.'}
 
     @app.post('/api/production-report/completion-upload')
     def completion_upload():
@@ -581,7 +591,13 @@ def register_production_export(app, workspace, load_report):
                         excluded.add(key)
                     times[key] = value
                 names.append(Path(upload.filename).name)
-            times = {key:value for key,value in times.items() if key not in excluded}
+            # Store Indian wall time for the timezone-free Excel Out Time cells.
+            # Do this before the production plan applies its weekend rule.
+            times = {
+                key: datetime.fromisoformat(value).replace(tzinfo=PORTAL_TIMEZONE)
+                .astimezone(IST).replace(tzinfo=None).isoformat()
+                for key, value in times.items() if key not in excluded
+            }
             token = uuid4().hex
             directory = exports/'completion-uploads'
             directory.mkdir(parents=True,exist_ok=True)
@@ -609,7 +625,8 @@ def register_production_export(app, workspace, load_report):
                     if not checkpoint or body.get('token')!=checkpoint['token']:
                         return jsonify(error='The restore point changed or is unavailable. Check the folder again.'),409
                     revert_excel(checkpoint)
-                    return jsonify(reverted=True,revert=None,message='Excel files restored to their exact state before the latest Proceed. Added rows and status changes from that action were undone.')
+                    return jsonify(reverted=True,revert=None,message='Excel files restored to their exact state before the latest Proceed. Added rows and status changes from that action were undone.',
+                                   **refresh_imports(checkpoint['changed'].values()))
                 previews=workspace.store.list()
                 preview_id=body.get('preview_id') or workspace.read().get('sla_preview_id') or (previews[0]['id'] if previews else None)
                 if type(preview_id) is not int or preview_id<1: raise ValueError('Extract or choose a saved preview first.')
@@ -633,6 +650,7 @@ def register_production_export(app, workspace, load_report):
                     result.update(completed=True,backups=backups,downloads=[{'name':v['path'].name,
                         'url':f'/api/production-report/download/{token}/{kind}'} for kind,v in info.items()])
                     (exports/token/'files.json').write_text(json.dumps({k:v['path'].name for k,v in info.items()}))
+                    result.update(refresh_imports(item['path'] for item in info.values()))
                 result['revert']=revert_available(body.get('folder',''),exports)
                 workspace.save(production_report_folder=str(next(iter(info.values()))['path'].parent))
                 return jsonify(result)

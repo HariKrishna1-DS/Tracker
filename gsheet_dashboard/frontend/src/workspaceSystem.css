@@ -144,8 +144,8 @@ body { background:var(--canvas); color:var(--text); }
 .report-order-search,.report-order-search .table-section { min-width:0; max-width:100%; }
 .report-order-search .table-scroll { width:100%; min-width:0; overflow:auto; }
 .sla-status-workspace .sla-report-tools { min-width:0; max-width:100%; }
-.sla-status-workspace .report-order-search-label,.capacity-report-tools>.report-order-search .report-order-search-label { justify-self:end; }
-@media(max-width:760px) { .sla-status-workspace .report-order-search-label,.capacity-report-tools>.report-order-search .report-order-search-label { justify-self:start; } }
+.sla-status-workspace .report-order-search-label { justify-self:end; }
+@media(max-width:760px) { .sla-status-workspace .report-order-search-label { justify-self:start; } }
 .studio-dialog { color:var(--text); background:var(--surface); border:1px solid var(--line); border-radius:var(--radius-dialog); box-shadow:0 24px 90px #0004; }
 .studio-dialog::backdrop { background:#0c1e32a8; backdrop-filter:blur(4px); }
 .studio-dialog .studio-dialog-heading { padding:22px 24px; background:var(--surface); border-bottom:1px solid var(--line); }
@@ -167,9 +167,8 @@ body { background:var(--canvas); color:var(--text); }
 :is(.workspace,.studio-dialog) .notice.success { border-left-color:var(--positive); background:color-mix(in srgb,var(--accent-soft) 50%,var(--surface)); }
 .workspace .report-notes { background:var(--surface); border:1px solid var(--line); padding:16px 20px; border-radius:var(--radius-card); margin:20px 0; color:var(--muted); font-size:12px; }
 .workspace .report-notes summary { color:var(--text); font-weight:600; cursor:pointer; }
-.capacity-report-tools { display:grid; grid-template-columns:minmax(0,2fr) minmax(0,3fr); align-items:start; gap:16px; }
+.capacity-report-tools { display:grid; grid-template-columns:minmax(0,1fr); gap:16px; }
 .workspace .capacity-report-tools>.report-notes { width:fit-content; max-width:100%; box-sizing:border-box; margin:0; padding:4px 14px; }
-.capacity-report-tools>.report-order-search { grid-column:2; }
 .capacity-backlog-charts { display:grid; grid-template-columns:minmax(0,2fr) minmax(280px,1fr); gap:16px; margin-top:16px; }
 .capacity-backlog-charts>.daily-chart { min-width:0; margin:0; }
 .capacity-pie { position:relative; isolation:isolate; width:min(78%,250px); aspect-ratio:1; margin:-12px auto -16px; }
@@ -187,10 +186,6 @@ body { background:var(--canvas); color:var(--text); }
 .capacity-pie-legend strong { font-variant-numeric:tabular-nums; }
 @media(max-width:900px) {
   .capacity-backlog-charts { grid-template-columns:minmax(0,1fr); }
-}
-@media(max-width:760px) {
-  .capacity-report-tools { grid-template-columns:minmax(0,1fr); }
-  .capacity-report-tools>.report-order-search { grid-column:1; }
 }
 .workspace .report-context { color:var(--muted); font-size:12px; line-height:1.65; }
 .workspace .recharts-default-tooltip { background:var(--surface)!important; border:1px solid var(--line)!important; border-radius:10px; color:var(--ink); box-shadow:var(--card-shadow); }
