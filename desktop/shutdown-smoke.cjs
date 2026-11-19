@@ -21,7 +21,7 @@ const path=require('node:path');
     });
     assert.equal(imported.status,201,JSON.stringify(imported.body));
     await page.reload();
-    await page.getByText('preview1',{exact:true}).first().waitFor();
+    await page.getByLabel('SLA preview',{exact:true}).locator('option').filter({hasText:'preview1'}).waitFor({state:'attached'});
     await page.waitForFunction(async()=>!(await fetch('/api/health').then(r=>r.json())).running);
     const origin=new URL(page.url()).origin;
     await app.evaluate(()=>{const original=globalThis.fetch;globalThis.fetch=(url,options)=>String(url).endsWith('/api/desktop/shutdown')?new Promise((_,reject)=>options.signal.addEventListener('abort',()=>reject(options.signal.reason),{once:true})):original(url,options);});
