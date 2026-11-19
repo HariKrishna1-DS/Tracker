@@ -12,7 +12,7 @@ def sla_status(value):
 
 
 def sla_key(row):
-    # Product report tabs store completion dates without the time of day.
+    # Completion timestamps retain the time; identity includes its calendar day.
     out = parse_report_datetime(row.get('Out Time', ''))
     return (str(row.get('Order Number', '')).strip(), out.date().isoformat() if out else '')
 
@@ -32,4 +32,6 @@ def sla_entry(row, status):
         'Free Site': status,
         'completion_date': completion,
         'source': 'Google Sheets' if row.get('_sheet') else 'Saved history',
+        **({'Source workbook': row['Source workbook']} if row.get('Source workbook') else {}),
+        **({'_record_key': row['_record_key']} if row.get('_record_key') else {}),
     }

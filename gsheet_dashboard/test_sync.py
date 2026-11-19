@@ -36,7 +36,7 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(color_update['range']['startRowIndex'], 1)
         self.assertEqual(color_update['fields'], 'userEnteredFormat.backgroundColor')
         self.assertEqual(color_update['rows'][0]['values'][0], color_update['rows'][0]['values'][1])
-        self.assertEqual(color_update['rows'][0]['values'][0]['userEnteredFormat']['backgroundColor'], sync.sheet_color('#a66ad3'))
+        self.assertEqual(color_update['rows'][0]['values'][0]['userEnteredFormat']['backgroundColor'], sync.sheet_color('#a66bd3'))
         self.assertEqual(requests[-1]['setBasicFilter']['filter']['range']['endRowIndex'], 3)
 
     def frame(self):
@@ -110,7 +110,7 @@ class SyncTests(unittest.TestCase):
             'Status': 'Completed and delivered', 'Orders': 2, 'Share': '50.0%'
         })
         self.assertEqual(sync.status_color('Typing in Progress'), '#00b050')
-        self.assertEqual(sync.status_color('Awaiting for Clarification'), '#a66ad3')
+        self.assertEqual(sync.status_color('Awaiting for Clarification'), '#a66bd3')
 
     def test_atomic_replace_gid_zero_and_literals(self):
         df = self.frame()
@@ -146,25 +146,25 @@ class SyncTests(unittest.TestCase):
     def test_failed_scrape_never_uploads_old_files(self):
         with tempfile.TemporaryDirectory() as folder, patch.object(sync, 'BASE_DIR', Path(folder)), \
                 patch.dict(sync.os.environ, {'DATATRACE_USERNAME': 'test', 'DATATRACE_PASSWORD': 'test'}), \
-                patch.object(sync.subprocess, 'run', return_value=Mock(returncode=1)), \
+                patch.object(sync, 'run_extractor', return_value=Mock(returncode=1,stdout='Fixture extraction failed',stderr='')), \
                 patch.object(sync, 'sync_workbook') as upload, \
                 patch.object(sync, 'export_to_excel_and_csv') as export:
-            result = sync.run_sync()
+            result = sync.run_sync(auto_sync=False)
             self.assertEqual(result['scrape'], 'failed')
             upload.assert_not_called()
             export.assert_not_called()
 
     def test_extraction_retains_export_without_google_sync(self):
-        def scrape(*args, **kwargs):
-            Path(kwargs['env']['DATATRACE_OUTPUT_JSON']).write_text(
+        def scrape(command, cwd, env, *args):
+            Path(env['DATATRACE_OUTPUT_JSON']).write_text(
                 self.frame().to_json(orient='records'), encoding='utf-8')
             return Mock(returncode=0)
         with tempfile.TemporaryDirectory() as folder, patch.object(sync, 'BASE_DIR', Path(folder)), \
                 patch.dict(sync.os.environ, {'DATATRACE_USERNAME': 'test', 'DATATRACE_PASSWORD': 'test'}), \
-                patch.object(sync.subprocess, 'run', side_effect=scrape), \
+                patch.object(sync, 'run_extractor', side_effect=scrape), \
                 patch.object(sync, 'sync_workbook') as upload:
             (Path(folder) / 'sync_status.json').write_text(json.dumps({'last_success_at': 'previous'}))
-            result = sync.run_sync()
+            result = sync.run_sync(auto_sync=False)
             self.assertEqual(result['scrape'], 'success')
             self.assertEqual(result['google_sheet'], 'not_synced')
             upload.assert_not_called()

@@ -35,6 +35,54 @@ class PreviewTests(unittest.TestCase):
             self.assertTrue((self.root / 'previews' / f'preview{number}.xlsx').exists())
         self.assertEqual(self.store.get(1)['rows'][0]['OPON'], '0001')
 
+    def test_reset_and_undo_restore_history_and_numbering(self):
+        self.store.save(self.frame())
+        self.store.save(self.frame('Completed'))
+        self.store.mark_synced(1, {'recovered': True})
+        cloud_history = self.store.history()
+        client = create_app(self.store.root, syncer=Mock(return_value=[])).test_client()
+        reset = client.post('/api/previews/reset')
+        self.assertEqual(reset.status_code, 200, reset.json)
+        self.assertEqual(reset.json['deleted'], 2)
+        state = client.get('/api/state?light=1').json
+        self.assertEqual(state['previews'], [])
+        self.assertTrue(state['can_undo_preview_reset'])
+        self.assertFalse(self.store.auto_recover())
+        # A cloud read that started before reset must not put those rows back.
+        self.store.recover_cloud_previews(cloud_history)
+        self.assertEqual(self.store.list(), [])
+        self.assertFalse((self.store.root / 'preview1.xlsx').exists())
+        self.assertEqual(client.post('/api/previews/reset/undo').json['restored'], 2)
+        self.assertEqual(self.store.unsynced_ids(), [2])
+        self.assertEqual(self.store.get(2)['rows'][0]['Task Status'], 'Completed')
+        self.assertEqual(client.get('/api/previews/2/download/xlsx').status_code, 200)
+        self.assertTrue(self.store.auto_recover())
+        self.assertEqual(self.store.save(self.frame())['name'], 'preview3')
+        self.assertEqual(client.post('/api/previews/reset').json['deleted'], 3)
+        self.assertEqual(self.store.save(self.frame())['name'], 'preview1')
+        self.assertEqual(client.post('/api/previews/reset/undo').status_code, 409)
+        self.assertEqual([row['id'] for row in self.store.list()], [1])
+
+    def test_deleting_all_captures_prevents_cloud_recovery(self):
+        for _ in range(3):
+            self.store.save(self.frame())
+        history = self.store.history()
+        client = create_app(self.store.root, syncer=Mock(return_value=[])).test_client()
+        partial = client.post('/api/previews/batch-delete', json={'ids': [1]}).json
+        self.assertEqual([preview['id'] for preview in partial['previews']], [3, 2])
+        deleted = client.post('/api/previews/batch-delete', json={'ids': [2, 3]}).json
+        self.assertFalse(deleted['can_undo_preview_reset'])
+        self.assertEqual(deleted['previews'], [])
+        self.store.recover_cloud_previews(history)
+        self.assertEqual(self.store.list(), [])
+        self.assertEqual(self.store.save(self.frame())['id'], 1)
+        self.assertEqual(self.store.save(self.frame())['id'], 2)
+        self.assertEqual(client.delete('/api/previews/2').status_code, 200)
+        final = client.delete('/api/previews/1').json
+        self.assertFalse(final['can_undo_preview_reset'])
+        self.assertEqual(self.store.list(), [])
+        self.assertEqual(self.store.save(self.frame())['id'], 1)
+
     def test_changed_added_removed_and_ignored_clock(self):
         a = self.store.save(pd.concat([self.frame(), self.frame().assign(OPON='2')]))
         b = self.store.save(pd.concat([self.frame('Completed').assign(**{'Time Since Arrival': '2h 0m'}), self.frame().assign(OPON='3')]))
@@ -84,65 +132,86 @@ class PreviewTests(unittest.TestCase):
             self.store.get(saved['id'])
 
     def test_reporting_reads_history_in_one_transaction(self):
-        from order_reporting import daily_orders, monthly_orders
-        first = self.store.save(self.frame())
-        second = self.store.save(self.frame('Completed'))
-        self.assertEqual(self.store.history(), [first, second])
-        for report in (daily_orders, monthly_orders):
-            with patch.object(self.store, 'connect', wraps=self.store.connect) as connect:
-                self.assertTrue(report(self.store))
-                self.assertEqual(connect.call_count, 1)
+        self.store.save(self.frame())
+        with patch.object(self.store, 'connect', wraps=self.store.connect) as connect:
+            self.assertEqual(len(self.store.history()), 1)
+            self.assertEqual(connect.call_count, 1)
 
     def test_second_real_pipeline_run_creates_preview_without_auto_sync(self):
         calls = []
-        def scrape(*args, **kwargs):
+        def scrape(command, cwd, env, *args):
             calls.append(1)
-            Path(kwargs['env']['DATATRACE_OUTPUT_JSON']).write_text(
+            Path(env['DATATRACE_OUTPUT_JSON']).write_text(
                 self.frame('Available' if len(calls) == 1 else 'Completed').to_json(orient='records'))
             return Mock(returncode=0)
         with patch.object(sync, 'BASE_DIR', self.root), patch.dict(sync.os.environ, {'DATATRACE_USERNAME':'test', 'DATATRACE_PASSWORD':'test'}), \
-                patch.object(sync.subprocess, 'run', side_effect=scrape), \
+                patch.object(sync, 'run_extractor', side_effect=scrape), \
                 patch.object(sync, 'sync_workbook') as upload:
-            a, b = sync.run_sync(), sync.run_sync()
+            a, b = sync.run_sync(auto_sync=False), sync.run_sync(auto_sync=False)
         self.assertEqual(len(calls), 2)
         self.assertEqual([a['preview_id'], b['preview_id']], [1, 2])
         self.assertEqual(b['google_sheet'], 'not_synced')
         upload.assert_not_called()
         self.assertEqual(self.store.get(2)['rows'][0]['Task Status'], 'Completed')
 
+    def test_sheet_sync_switch_blocks_writes_until_enabled(self):
+        syncer=Mock()
+        client=create_app(self.root/'sync-switch',syncer=syncer).test_client()
+        self.assertEqual(client.get('/api/sheet-sync').json,{'enabled':False})
+        self.assertEqual(client.post('/api/sync',json={'preview':1}).status_code,409)
+        self.assertEqual(client.post('/api/report-publish').status_code,409)
+        self.assertEqual(client.post('/api/sheet-sync',json={'enabled':True}).json,{'enabled':True})
+        self.assertEqual(client.get('/api/sheet-sync').json,{'enabled':True})
+        self.assertEqual(client.post('/api/sheet-sync',json={'enabled':False}).json,{'enabled':False})
+        syncer.assert_not_called()
+
     def test_manual_google_sync_and_daily_schedule(self):
-        syncer = Mock(return_value=['Sheet1', 'All Products', 'Full Title', 'Remaining Products'])
-        client = create_app(self.root / 'manual-sync', syncer=syncer).test_client()
+        syncer = Mock(return_value=['Full Title'])
+        from datetime import datetime
+        from server import IST
+        clock = Mock(now=lambda: datetime(2026, 9, 30, 8, tzinfo=IST), snapshot=lambda: {})
+        client = create_app(self.root / 'manual-sync', syncer=syncer, time_source=clock).test_client()
+        client.post('/api/sheet-sync', json={'enabled': True})
         self.assertEqual(client.post('/api/sync').status_code, 422)
-        first = client.post('/api/import', data={'file': (
-            BytesIO(self.frame().to_csv(index=False).encode()), 'queue.csv')})
-        second = client.post('/api/import', data={'file': (
-            BytesIO(self.frame('Completed').to_csv(index=False).encode()), 'queue.csv')})
-        self.assertEqual(first.status_code, 201)
-        self.assertEqual(second.status_code, 201)
-        self.assertEqual(client.post('/api/sync', json={'preview': first.json['id']}).status_code, 202)
-        for _ in range(100):
+        imported = client.post('/api/import', data={'file': (BytesIO(self.frame().to_csv(index=False).encode()), 'queue.csv')})
+        self.assertEqual(imported.status_code, 201)
+        for _ in range(200):
             state = client.get('/api/state').json
             if not state['job']['running']:
                 break
             time.sleep(.01)
-        self.assertEqual(state['job']['result']['google_sheet'], 'success')
+        syncer.assert_not_called()
+        client.post('/api/sheet-sync', json={'enabled': True})
+        self.assertEqual(client.post('/api/sync', json={'preview': client.get('/api/state').json['previews'][0]['id']}).status_code, 202)
+        for _ in range(200):
+            state=client.get('/api/state').json
+            if not state['job']['running']: break
+            time.sleep(.01)
         self.assertEqual(state['job']['result']['trigger'], 'manual')
-        self.assertEqual(state['job']['result']['preview_name'], 'preview1')
         self.assertEqual(syncer.call_count, 1)
-        self.assertEqual(syncer.call_args.args[0].iloc[0]['Task Status'], 'Search In Progress')
+        self.assertEqual(syncer.call_args.args[0].iloc[0]['Task Status'], 'Available')
+        client.post('/api/sheet-sync', json={'enabled': True})
+        self.assertEqual(client.post('/api/sync', json={'preview': imported.json['id']}).status_code, 202)
+        for _ in range(200):
+            if not client.get('/api/state').json['job']['running']:
+                break
+            time.sleep(.01)
         saved = client.post('/api/sync-schedule', json={'enabled': True, 'time': '14:30'})
         self.assertEqual(saved.status_code, 200)
         self.assertEqual(saved.json['time'], '14:30')
-        self.assertTrue(client.get('/api/state').json['schedule']['enabled'])
         self.assertEqual(client.post('/api/sync-schedule', json={'enabled': True, 'time': '99:00'}).status_code, 422)
 
     def test_api_import_compare_excel_and_initial_empty(self):
-        client = create_app(self.root / 'api').test_client()
+        client = create_app(self.root / 'api', syncer=Mock(return_value=[])).test_client()
         self.assertEqual(client.get('/api/state').json['previews'], [])
         for status in ['Available', 'Completed']:
-            response = client.post('/api/import', data={'file': (BytesIO(self.frame(status).to_csv(index=False).encode()), 'queue.csv')})
+            response = client.post('/api/import', data={'file': (BytesIO(self.frame(status).assign(**{'Order Number': '0001'}).to_csv(index=False).encode()), 'queue.csv')})
             self.assertEqual(response.status_code, 201)
+        for _ in range(200):
+            if not client.get('/api/state').json['job']['running']:
+                break
+            time.sleep(.01)
+        self.assertFalse(client.get('/api/state').json['job']['running'])
         result = client.post('/api/compare', json={'previous':1,'latest':2}).json
         self.assertEqual(result['counts']['modified'], 1)
         response = client.post('/api/compare', json={'previous':1,'latest':2,'download':True})

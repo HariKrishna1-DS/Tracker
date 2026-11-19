@@ -3,21 +3,26 @@ from collections import Counter
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import json
-import os
 from pathlib import Path
+import shutil
 import sqlite3
 
 import pandas as pd
-from dotenv import load_dotenv
-
-load_dotenv(Path(__file__).resolve().with_name('.env'))
 
 IGNORED = {'Sync Timestamp', 'Queue Age Hours', 'Time Since Arrival', 'Task Time in Queue'}
 CHANGE_COLUMNS = ['Change', 'Task Key', 'Column', 'Previous Value', 'Latest Value']
+CAPTURE_TABLES = {
+    'previews': ('id', 'created', 'source', 'columns_json', 'rows_json'),
+    'sync_jobs': ('preview_id', 'state'),
+    'sync_reports': ('preview_id', 'sha256', 'report_json', 'committed'),
+    'sync_failures': ('preview_id', 'error', 'created'),
+    'sync_receipts': ('preview_id', 'report_json'),
+}
 
 
 class PreviewStore:
     def __init__(self, root):
+        # Local retry cache only. Production reports read Google Sheets.
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
         with self.connect() as db:
@@ -25,23 +30,95 @@ class PreviewStore:
                        'created TEXT NOT NULL, source TEXT NOT NULL, columns_json TEXT NOT NULL, rows_json TEXT NOT NULL)')
             db.execute('CREATE TABLE IF NOT EXISTS sla_corrections ('
                        'order_number TEXT NOT NULL, completion_date TEXT NOT NULL, '
-                       "status TEXT NOT NULL, updated TEXT NOT NULL, PRIMARY KEY (order_number, completion_date))")
+                       "status TEXT NOT NULL CHECK (status IN ('On Time', 'Missed')), updated TEXT NOT NULL, "
+                       'PRIMARY KEY (order_number, completion_date))')
+            db.execute('CREATE TABLE IF NOT EXISTS sync_receipts ('
+                       'preview_id INTEGER PRIMARY KEY, report_json TEXT NOT NULL)')
             db.execute('CREATE TABLE IF NOT EXISTS sync_jobs (preview_id INTEGER PRIMARY KEY, state TEXT NOT NULL)')
-            db.execute('CREATE TABLE IF NOT EXISTS sync_reports ('
-                       'preview_id INTEGER PRIMARY KEY, sha256 TEXT NOT NULL, report_json TEXT NOT NULL, '
-                       'committed INTEGER NOT NULL DEFAULT 0)')
+            db.execute('CREATE TABLE IF NOT EXISTS sync_reports (preview_id INTEGER PRIMARY KEY, sha256 TEXT NOT NULL, report_json TEXT NOT NULL, committed INTEGER NOT NULL DEFAULT 0)')
             db.execute('CREATE TABLE IF NOT EXISTS sync_failures (preview_id INTEGER PRIMARY KEY, error TEXT NOT NULL, created TEXT NOT NULL)')
-        # Recover exported snapshots which existed before switching to local storage.
-        known = {p['id'] for p in self.list()}
-        for path in sorted(self.root.glob('preview*.csv')):
-            suffix = path.stem.removeprefix('preview')
-            if suffix.isdigit() and int(suffix) not in known:
-                frame = pd.read_csv(path, dtype=str, keep_default_na=False)
-                created = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat()
-                with self.connect() as db:
-                    db.execute('INSERT OR IGNORE INTO previews VALUES(?,?,?,?,?)',
-                               (int(suffix), created, 'Recovered local export', json.dumps(list(frame.columns)),
-                                frame.to_json(orient='records')))
+            db.execute('CREATE TABLE IF NOT EXISTS capture_settings (id INTEGER PRIMARY KEY, payload TEXT NOT NULL)')
+            db.execute('CREATE TABLE IF NOT EXISTS capture_reset_archive (kind TEXT NOT NULL, payload TEXT NOT NULL)')
+            # Upgrade v2.0 without re-uploading already committed snapshots.
+            db.execute("INSERT OR IGNORE INTO sync_jobs SELECT preview_id, 'synced' FROM sync_receipts")
+
+    def auto_recover(self):
+        with self.connect() as db:
+            return self._auto_recover(db)
+
+    def _auto_recover(self, db):
+        row = db.execute('SELECT payload FROM capture_settings WHERE id=1').fetchone()
+        return not row or self.decode(row[0])['auto_recover']
+
+    def restarted_numbering(self):
+        with self.connect() as db:
+            row = db.execute('SELECT payload FROM capture_settings WHERE id=1').fetchone()
+            return bool(row and self.decode(row[0]).get('restarted_numbering'))
+
+    def recover_cloud_previews(self, previews):
+        """Apply a cloud history read only if local recovery is still allowed."""
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            if not self._auto_recover(db) or db.execute('SELECT 1 FROM previews LIMIT 1').fetchone():
+                return
+            for preview in previews:
+                number = preview['id']
+                db.execute('INSERT INTO previews(id,created,source,columns_json,rows_json) VALUES(?,?,?,?,?)',
+                           (number, preview['created'], preview['source'],
+                            json.dumps(preview['columns']), json.dumps(preview['rows'])))
+                db.execute("INSERT OR REPLACE INTO sync_jobs VALUES (?, 'synced')", (number,))
+                db.execute('DELETE FROM sync_failures WHERE preview_id=?', (number,))
+                db.execute('INSERT OR REPLACE INTO sync_receipts VALUES (?,?)', (number, '{"recovered": true}'))
+
+    def reset_status(self):
+        with self.connect() as db:
+            started = bool(db.execute("SELECT 1 FROM sqlite_sequence WHERE name='previews' AND seq>0").fetchone())
+            undo = not started and bool(db.execute("SELECT 1 FROM capture_reset_archive WHERE kind='reset'").fetchone())
+            return {'can_reset_previews': started, 'can_undo_preview_reset': undo}
+
+    def reset_previews(self):
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            ids = [row[0] for row in db.execute('SELECT id FROM previews')]
+            seq = db.execute("SELECT seq FROM sqlite_sequence WHERE name='previews'").fetchone()
+            if not seq or not seq[0]:
+                raise ValueError('Capture numbering is already reset.')
+            previous = db.execute('SELECT payload FROM capture_settings WHERE id=1').fetchone()
+            db.execute('DELETE FROM capture_reset_archive')
+            db.execute("INSERT INTO capture_reset_archive VALUES ('reset', ?)",
+                       (json.dumps([seq[0], previous[0] if previous else None]),))
+            for table, fields in CAPTURE_TABLES.items():
+                db.execute(f"INSERT INTO capture_reset_archive SELECT ?,json_array({','.join(fields)}) FROM {table}", (table,))
+                db.execute(f'DELETE FROM {table}')
+            db.execute("DELETE FROM sqlite_sequence WHERE name='previews'")
+            db.execute('INSERT OR REPLACE INTO capture_settings VALUES (1,?)', (json.dumps({'auto_recover': False}),))
+        for number in ids:
+            for suffix in ('csv', 'xlsx'):
+                try:
+                    (self.root / f'preview{number}.{suffix}').unlink(missing_ok=True)
+                except OSError:
+                    # Downloads use the database and will not expose an old export.
+                    pass
+        return len(ids)
+
+    def undo_preview_reset(self):
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            archive = db.execute("SELECT payload FROM capture_reset_archive WHERE kind='reset'").fetchone()
+            if not archive or db.execute("SELECT 1 FROM sqlite_sequence WHERE name='previews' AND seq>0").fetchone():
+                raise ValueError('Undo is available until the next capture is saved.')
+            sequence, settings = self.decode(archive[0])
+            for table, fields in CAPTURE_TABLES.items():
+                values = ','.join(f"json_extract(payload,'$[{i}]')" for i in range(len(fields)))
+                db.execute(f"INSERT INTO {table} ({','.join(fields)}) SELECT {values} FROM capture_reset_archive WHERE kind=?", (table,))
+            db.execute("DELETE FROM sqlite_sequence WHERE name='previews'")
+            db.execute("INSERT INTO sqlite_sequence VALUES ('previews',?)", (sequence,))
+            db.execute('DELETE FROM capture_settings WHERE id=1')
+            if settings:
+                db.execute('INSERT INTO capture_settings VALUES (1,?)', (settings,))
+            db.execute('DELETE FROM capture_reset_archive')
+            return db.execute('SELECT COUNT(*) FROM previews').fetchone()[0]
+
 
     @contextmanager
     def connect(self):
@@ -56,10 +133,114 @@ class PreviewStore:
     def decode(value):
         return json.loads(value) if isinstance(value, str) else value
 
-    def mark_synced(self, number):
+    def save(self, frame, source='DataTrace'):
+        from datatrace_sync import export_to_excel_and_csv
+        frame = frame.copy().fillna('')
+        frame.columns = [str(c).strip() for c in frame.columns]
+        if not len(frame.columns) or frame.columns.duplicated().any() or any(not c for c in frame.columns):
+            raise ValueError('The file must contain unique, nonblank column names.')
+        rows = json.loads(frame.to_json(orient='records', date_format='iso'))
+        created = datetime.now(timezone.utc).isoformat()
+        with self.connect() as db:
+            cursor = db.execute('INSERT INTO previews(created,source,columns_json,rows_json) VALUES(?,?,?,?)',
+                                (created, source, json.dumps(list(frame.columns)), json.dumps(rows)))
+            number = cursor.lastrowid
+            export_to_excel_and_csv(frame, self.root / f'preview{number}')
+        return self.get(number)
+
+    def restore(self, number, columns, rows, source='Google Sheets recovery', created=None):
+        """Recover the last synced numbered preview after ephemeral storage is lost."""
+        if number < 1 or not columns:
+            raise ValueError('A numbered preview with rows is required for recovery.')
+        created = created or datetime.now(timezone.utc).isoformat()
+        with self.connect() as db:
+            db.execute('INSERT OR IGNORE INTO previews(id,created,source,columns_json,rows_json) '
+                       'VALUES(?,?,?,?,?)', (number, created, source, json.dumps(columns), json.dumps(rows)))
+        return self.get(number)
+
+    def list(self):
+        with self.connect() as db:
+            return [{'id': i, 'name': f'preview{i}', 'created': created, 'source': source,
+                     'row_count': count} for i, created, source, count in
+                    db.execute('SELECT id,created,source,json_array_length(rows_json) FROM previews ORDER BY id DESC')]
+
+    def get(self, number):
+        with self.connect() as db:
+            query = 'SELECT created,source,columns_json,rows_json FROM previews WHERE id=' + '?'
+            record = db.execute(query, (number,)).fetchone()
+        if not record:
+            raise KeyError('Preview not found.')
+        return {'id': number, 'name': f'preview{number}', 'created': record[0], 'source': record[1],
+                'columns': self.decode(record[2]), 'rows': self.decode(record[3])}
+
+    def history(self, include_sla_corrections=False):
+        """Read complete history in one transaction for reporting."""
+        with self.connect() as db:
+            records = db.execute('SELECT id,created,source,columns_json,rows_json FROM previews ORDER BY id').fetchall()
+            corrections = ({(number, date): status for number, date, status in
+                            db.execute('SELECT order_number,completion_date,status FROM sla_corrections')}
+                           if include_sla_corrections else None)
+        history = [{'id': number, 'name': f'preview{number}', 'created': created, 'source': source,
+                    'columns': self.decode(columns), 'rows': self.decode(rows)}
+                   for number, created, source, columns, rows in records]
+        return (history, corrections) if include_sla_corrections else history
+
+    def delete(self, number):
+        if not self.delete_many([number]):
+            raise KeyError('Preview not found.')
+
+    def delete_many(self, numbers):
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            deleted = sorted(set(numbers) & {row[0] for row in db.execute('SELECT id FROM previews')})
+            db.executemany('DELETE FROM previews WHERE id=?', ((number,) for number in deleted))
+            for table in CAPTURE_TABLES.keys() - {'previews'}:
+                db.executemany(f'DELETE FROM {table} WHERE preview_id=?', ((number,) for number in deleted))
+            if deleted and not db.execute('SELECT 1 FROM previews LIMIT 1').fetchone():
+                db.execute("DELETE FROM sqlite_sequence WHERE name='previews'")
+                db.execute('DELETE FROM capture_reset_archive')
+                for table in CAPTURE_TABLES.keys() - {'previews'}:
+                    db.execute(f'DELETE FROM {table} WHERE preview_id>0')
+                db.execute('INSERT OR REPLACE INTO capture_settings VALUES (1,?)',
+                           (json.dumps({'auto_recover': False, 'restarted_numbering': True}),))
+            for number in deleted:
+                for suffix in ('csv', 'xlsx'):
+                    try:
+                        (self.root / f'preview{number}.{suffix}').unlink(missing_ok=True)
+                    except OSError:
+                        # Downloads use the database; a new save replaces the export.
+                        pass
+        return deleted
+
+    def sla_corrections(self):
+        with self.connect() as db:
+            return {(number, date): status for number, date, status in
+                    db.execute('SELECT order_number,completion_date,status FROM sla_corrections')}
+
+    def save_sla_correction(self, order_number, completion_date, status):
+        self.save_sla_corrections([(order_number, completion_date, status)])
+
+    def save_sla_corrections(self, corrections):
+        """Validate the entire selection, then persist it in one transaction."""
+        records = []
+        updated = datetime.now(timezone.utc).isoformat()
+        for order_number, completion_date, status in corrections:
+            if not order_number or status not in ('On Time', 'Missing', 'Missed'):
+                raise ValueError('An order number and On Time or Missed status are required.')
+            if datetime.strptime(completion_date, '%Y-%m-%d').strftime('%Y-%m-%d') != completion_date:
+                raise ValueError('A valid completion date is required.')
+            records.append((order_number, completion_date, 'Missed' if status == 'Missing' else status, updated))
+        placeholders = '?,?,?,?'
+        with self.connect() as db:
+            db.cursor().executemany('INSERT INTO sla_corrections(order_number,completion_date,status,updated) '
+                                   f'VALUES({placeholders}) ON CONFLICT(order_number,completion_date) '
+                                   'DO UPDATE SET status=excluded.status,updated=excluded.updated', records)
+
+    def mark_synced(self, number, report=None):
         with self.connect() as db:
             db.execute("INSERT INTO sync_jobs VALUES(?, 'synced') ON CONFLICT(preview_id) DO UPDATE SET state='synced'", (number,))
             db.execute('DELETE FROM sync_failures WHERE preview_id=?', (number,))
+            db.execute('INSERT INTO sync_receipts VALUES(?,?) ON CONFLICT(preview_id) DO UPDATE SET report_json=excluded.report_json', (number, json.dumps(report or {})))
 
     def stage_sync_report(self, number, digest, report):
         """Keep the report ready before the Google batch, including lost replies."""
@@ -88,7 +269,7 @@ class PreviewStore:
         with self.connect() as db:
             row = db.execute('SELECT preview_id,report_json FROM sync_reports WHERE committed=1 AND preview_id>0 '
                              'ORDER BY preview_id DESC LIMIT 1').fetchone()
-        return self.decode(row[1]) if row else {}
+        return {k: v for k, v in self.decode(row[1]).items() if not k.startswith('_')} if row else {}
 
     def mark_failed(self, number, error='Automatic sync failed after retries. Preview retained.'):
         with self.connect() as db:
@@ -102,92 +283,79 @@ class PreviewStore:
                     for number, error, created in db.execute('SELECT preview_id,error,created FROM sync_failures ORDER BY preview_id')]
 
     def pending_syncs(self):
+        """Automatic retries stop at the first failed capture until explicit retry."""
         with self.connect() as db:
-            return [r[0] for r in db.execute('SELECT id FROM previews LEFT JOIN sync_jobs ON preview_id=id WHERE state IS NULL ORDER BY id')]
+            rows = db.execute("SELECT id,state FROM previews LEFT JOIN sync_jobs ON preview_id=id WHERE state IS NULL OR state!='synced' ORDER BY id").fetchall()
+        pending = []
+        for number, state in rows:
+            if state == 'failed':
+                break
+            pending.append(number)
+        return pending
 
-    def save(self, frame, source='DataTrace'):
-        from datatrace_sync import export_to_excel_and_csv
-        frame = frame.copy().fillna('')
-        frame.columns = [str(c).strip() for c in frame.columns]
-        if not len(frame.columns) or frame.columns.duplicated().any() or any(not c for c in frame.columns):
-            raise ValueError('The file must contain unique, nonblank column names.')
-        rows = json.loads(frame.to_json(orient='records', date_format='iso'))
-        created = datetime.now(timezone.utc).isoformat()
+    def unsynced_ids(self):
         with self.connect() as db:
-            query = 'INSERT INTO previews(created,source,columns_json,rows_json) VALUES(?,?,?,?)'
-            cursor = db.execute(query, (created, source, json.dumps(list(frame.columns)), json.dumps(rows)))
-            number = cursor.lastrowid
-            export_to_excel_and_csv(frame, self.root / f'preview{number}')
-        return self.get(number)
+            return [row[0] for row in db.execute("SELECT id FROM previews LEFT JOIN sync_jobs ON preview_id=id WHERE state IS NULL OR state!='synced' ORDER BY id")]
 
-    def restore(self, number, columns, rows, source='Google Sheets recovery', created=None):
-        """Recover the last synced numbered preview after ephemeral storage is lost."""
-        if number < 1 or not columns:
-            raise ValueError('A numbered preview with rows is required for recovery.')
-        created = created or datetime.now(timezone.utc).isoformat()
+    def pending(self):
+        return [self.get(number) for number in self.unsynced_ids()]
+
+    def pending_count(self):
         with self.connect() as db:
-            db.execute('INSERT OR IGNORE INTO previews(id,created,source,columns_json,rows_json) '
-                       'VALUES(?,?,?,?,?)', (number, created, source, json.dumps(columns), json.dumps(rows)))
-        return self.get(number)
+            return db.execute("SELECT COUNT(*) FROM previews LEFT JOIN sync_jobs ON preview_id=id WHERE state IS NULL OR state!='synced'").fetchone()[0]
 
-    def list(self):
-        with self.connect() as db:
-            return [{'id': i, 'name': f'preview{i}', 'created': created, 'source': source,
-                     'row_count': len(self.decode(rows))} for i, created, source, rows in
-                    db.execute('SELECT id,created,source,rows_json FROM previews ORDER BY id DESC')]
-
-    def get(self, number):
-        with self.connect() as db:
-            query = 'SELECT created,source,columns_json,rows_json FROM previews WHERE id=' + '?'
-            record = db.execute(query, (number,)).fetchone()
-        if not record:
-            raise KeyError('Preview not found.')
-        return {'id': number, 'name': f'preview{number}', 'created': record[0], 'source': record[1],
-                'columns': self.decode(record[2]), 'rows': self.decode(record[3])}
-
-    def history(self, include_sla_corrections=False):
-        """Read complete history in one transaction for reporting."""
-        with self.connect() as db:
-            records = db.execute('SELECT id,created,source,columns_json,rows_json FROM previews ORDER BY id').fetchall()
-            corrections = ({(number, date): status for number, date, status in
-                            db.execute('SELECT order_number,completion_date,status FROM sla_corrections')}
-                           if include_sla_corrections else None)
-        history = [{'id': number, 'name': f'preview{number}', 'created': created, 'source': source,
-                    'columns': self.decode(columns), 'rows': self.decode(rows)}
-                   for number, created, source, columns, rows in records]
-        return (history, corrections) if include_sla_corrections else history
-
-    def delete(self, number):
-        with self.connect() as db:
-            cursor = db.execute('DELETE FROM previews WHERE id=' + '?', (number,))
-        if not cursor.rowcount:
-            raise KeyError('Preview not found.')
-        for suffix in ('csv', 'xlsx'):
-            (self.root / f'preview{number}.{suffix}').unlink(missing_ok=True)
-
-    def sla_corrections(self):
-        with self.connect() as db:
-            return {(number, date): status for number, date, status in
-                    db.execute('SELECT order_number,completion_date,status FROM sla_corrections')}
-
-    def save_sla_correction(self, order_number, completion_date, status):
-        self.save_sla_corrections([(order_number, completion_date, status)])
-
-    def save_sla_corrections(self, corrections):
-        """Validate the entire selection, then persist it in one transaction."""
-        records = []
-        updated = datetime.now(timezone.utc).isoformat()
-        for order_number, completion_date, status in corrections:
-            if not order_number or status not in ('On Time', 'Missing', 'Missed'):
-                raise ValueError('An order number and On Time or Missed status are required.')
-            if datetime.strptime(completion_date, '%Y-%m-%d').strftime('%Y-%m-%d') != completion_date:
-                raise ValueError('A valid completion date is required.')
-            records.append((order_number, completion_date, 'Missed' if status == 'Missing' else status, updated))
-        placeholders = '?,?,?,?'
-        with self.connect() as db:
-            db.cursor().executemany('INSERT INTO sla_corrections(order_number,completion_date,status,updated) '
-                                   f'VALUES({placeholders}) ON CONFLICT(order_number,completion_date) '
-                                   'DO UPDATE SET status=excluded.status,updated=excluded.updated', records)
+    def rebase_unsynced(self, first_id, cloud_max):
+        """Give a conflicting pending suffix fresh numbers, preserving every capture."""
+        copied = []
+        originals = []
+        mapping = {}
+        try:
+            with self.connect() as db:
+                db.execute('BEGIN IMMEDIATE')
+                pending = [row[0] for row in db.execute(
+                    "SELECT id FROM previews LEFT JOIN sync_jobs ON preview_id=id "
+                    "WHERE id>=? AND (state IS NULL OR state!='synced') ORDER BY id", (first_id,))]
+                if not pending or pending[0] != first_id:
+                    raise ValueError('The conflicting preview is no longer pending. Refresh captures and try again.')
+                if db.execute("SELECT 1 FROM previews JOIN sync_jobs ON preview_id=id "
+                              "WHERE id>? AND state='synced' LIMIT 1", (first_id,)).fetchone():
+                    raise ValueError('A newer local capture is already synced. Review both histories before renumbering.')
+                for old in pending:
+                    if db.execute('SELECT 1 FROM sync_receipts WHERE preview_id=?', (old,)).fetchone() or db.execute(
+                            'SELECT 1 FROM sync_reports WHERE preview_id=? AND committed=1', (old,)).fetchone():
+                        raise ValueError(f'preview{old} has a cloud receipt; review its history before renumbering.')
+                next_id = max(cloud_max, db.execute('SELECT COALESCE(MAX(id),0) FROM previews').fetchone()[0])
+                for old in pending:
+                    while True:
+                        next_id += 1
+                        if not any((self.root / f'preview{next_id}.{ext}').exists() for ext in ('csv', 'xlsx')):
+                            break
+                    mapping[old] = next_id
+                for old, new in mapping.items():
+                    for ext in ('csv', 'xlsx'):
+                        source = self.root / f'preview{old}.{ext}'
+                        if source.exists():
+                            target = self.root / f'preview{new}.{ext}'
+                            copied.append(target)
+                            shutil.copy2(source, target)
+                            originals.append(source)
+                for old, new in mapping.items():
+                    db.execute('UPDATE previews SET id=? WHERE id=?', (new, old))
+                    db.execute('DELETE FROM sync_jobs WHERE preview_id=?', (old,))
+                    db.execute("INSERT INTO sync_jobs(preview_id,state) VALUES(?,'pending')", (new,))
+                    db.execute('DELETE FROM sync_failures WHERE preview_id=?', (old,))
+                    db.execute('DELETE FROM sync_reports WHERE preview_id=?', (old,))
+                db.execute("UPDATE sqlite_sequence SET seq=MAX(seq,?) WHERE name='previews'", (next_id,))
+        except Exception:
+            for path in copied:
+                path.unlink(missing_ok=True)
+            raise
+        for path in originals:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return mapping
 
 
 def rows_after_last_order(previous, latest):
@@ -267,7 +435,14 @@ def text_value(value):
     return '' if value is None else str(value)
 
 
-def compare(previous, latest, keys=None, ignore=None):
+def comparison_value(value):
+    # Google Sheets returns boolean cells as TRUE/FALSE; local JSON uses bools.
+    # Preserve identifiers and all other text exactly, including leading zeros.
+    rendered = text_value(value)
+    return rendered.casefold() if rendered.casefold() in ('true', 'false') else rendered
+
+
+def compare(previous, latest, keys=None, ignore=None, history=None):
     ignored = IGNORED if ignore is None else set(ignore)
     columns = [c for c in dict.fromkeys(previous['columns'] + latest['columns']) if c not in ignored]
     old, new = previous['rows'], latest['rows']
@@ -276,7 +451,7 @@ def compare(previous, latest, keys=None, ignore=None):
         if not candidate or any(c not in previous['columns'] or c not in latest['columns'] for c in candidate):
             return False
         for rows in (old, new):
-            identities = [tuple(text_value(row.get(c)).strip().casefold() for c in candidate) for row in rows]
+            identities = [tuple(text_value(row.get(c)).strip().casefold() if c == 'Order Number' else text_value(row.get(c)) for c in candidate) for row in rows]
             if any(not any(k) for k in identities) or len(set(identities)) != len(identities):
                 return False
         return True
@@ -297,7 +472,7 @@ def compare(previous, latest, keys=None, ignore=None):
 
     if keys:
         def index(rows):
-            return {tuple(text_value(row.get(c)).strip().casefold() for c in keys): row for row in rows}
+            return {tuple(text_value(row.get(c)).strip().casefold() if c == 'Order Number' else text_value(row.get(c)) for c in keys): row for row in rows}
         before, after = index(old), index(new)
         for key in dict.fromkeys(list(before) + list(after)):
             a, b = before.get(key), after.get(key)
@@ -309,7 +484,7 @@ def compare(previous, latest, keys=None, ignore=None):
                                 'Previous Value': json.dumps(a, ensure_ascii=False) if a else '',
                                 'Latest Value': json.dumps(b, ensure_ascii=False) if b else ''})
             else:
-                changed = [c for c in columns if text_value(a.get(c)) != text_value(b.get(c))]
+                changed = [c for c in columns if comparison_value(a.get(c)) != comparison_value(b.get(c))]
                 counts['modified' if changed else 'unchanged'] += 1
                 matched_rows.append(comparison_row('Matched - changed' if changed else 'Unchanged', b))
                 for c in changed:
@@ -322,7 +497,7 @@ def compare(previous, latest, keys=None, ignore=None):
         method = 'Matched by ' + ', '.join(keys)
     else:
         def fingerprints(rows):
-            return Counter(tuple(text_value(row.get(c)) for c in columns) for row in rows)
+            return Counter(tuple(comparison_value(row.get(c)) for c in columns) for row in rows)
         before, after = fingerprints(old), fingerprints(new)
         counts['unchanged'] = sum((before & after).values())
         for values, frequency in (before & after).items():
@@ -342,6 +517,15 @@ def compare(previous, latest, keys=None, ignore=None):
     record_counts = {'matched': counts['modified'] + counts['unchanged'],
                      'missing': counts['removed'], 'newly_added': counts['added'],
                      'unchanged': counts['unchanged']}
+    from production_timing import completion_from_out_time
+    if keys == ['Order Number']:
+        from preview_completion import comparison_completions
+        decorated = comparison_completions(matched_rows + unmatched_rows, previous, latest, history)
+    else:
+        decorated = [completion_from_out_time(row) for row in matched_rows + unmatched_rows]
+    matched_rows, unmatched_rows = decorated[:len(matched_rows)], decorated[len(matched_rows):]
+    if any(row.get('Status') == 'Completed and Delivered' for row in decorated):
+        record_columns = list(dict.fromkeys(['Comparison Status', 'Order Number', 'Status', 'Out Time'] + record_columns))
     return {'columns': CHANGE_COLUMNS, 'rows': changes, 'counts': counts, 'keys': keys, 'method': method,
             'record_columns': record_columns, 'matched_rows': matched_rows,
             'unmatched_rows': unmatched_rows, 'record_counts': record_counts,

@@ -1,372 +1,40 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import {CaptureLibrary, NavbarPreferences} from './WorkspaceRefresh';
+import {ActivityProvider, ActivityPanel, LoadingScreen} from './LoadingExperience';
+import {FilterableTable} from './ColumnFilters';
+import React, { useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { Activity, ArrowDown, ArrowUp, ArrowDownToLine, ArrowLeftRight, BarChart3, CalendarDays, Check, ChevronLeft, ChevronRight, Clock3, CloudUpload, Database, FileSpreadsheet, Filter, LoaderCircle, Maximize2, Minimize2, Play, Plus, Printer, Search, SlidersHorizontal, Table2, Trash2, Upload, X } from 'lucide-react';
-import { ResponsiveContainer, BarChart, Bar, LineChart, Line, AreaChart, Area, PieChart, Pie, Cell, XAxis, YAxis, CartesianGrid, Tooltip, Brush, LabelList } from 'recharts';
+import { Activity, Camera, Home, ListFilter, Settings2, ArrowDown, ArrowUp, ArrowDownToLine, ArrowLeftRight, BarChart3, CalendarDays, Check, ChevronLeft, ChevronRight, Clock3, CloudUpload, Database, FileSpreadsheet, Filter, HardDrive, LoaderCircle, Maximize2, Minimize2, Play, Plus, Printer, Search, SlidersHorizontal, Table2, Trash2, Upload, X } from 'lucide-react';
 import './style.css';
-import STATUS_COLORS from '../../status_colors.json';
+import './tokens.css';
+import './workspacePolish.css';
+import './workspaceRefresh.css';
+import './workspaceSystem.css';
+import './slaCompareDesign.css';
+import './slaTypography.css';
+import './tableGrid.css';
+import './workspaceContext.css';
+import {OrdersWorkspace, ProductionOverview, OperationActivity, ThemeControl, VIEW_TITLES} from './StudioWorkspace';
+import ReportControls from './ReportControls';
+const CapacityReport = React.lazy(() => import('./CapacityReport'));
+const ImportExcelChanges = React.lazy(() => import('./ImportExcelChanges'));
+const ProductionReport = React.lazy(() => import('./ProductionReport'));
+const SlaStatus = React.lazy(() => import('./SlaStatus'));
+const SlaCompare = React.lazy(() => import('./SlaCompare'));
+import DismissibleNotice from './DismissibleNotice';
+import {WorkspaceSidebar, WorkspaceContext, SheetSegments, CapturePicker, useSidebarState} from './WorkspaceShell';
+import {MonthlyActivity} from './MonthlyMaintenance';
+import {DesktopTools, LocalWelcome, OfflineNotice, WorkspaceBoundary} from './DesktopExperience';
 import remainingProducts from '../../remaining_products.json';
+import {readProduction,invalidateProduction} from './productionResource';
 
-const EMPTY = {columns: [], rows: []};
-const DEFAULT_IGNORE = ['Sync Timestamp', 'Queue Age Hours', 'Time Since Arrival', 'Task Time in Queue'];
-const colors = ['#147d72', '#d79a32', '#596cc0', '#bb6179', '#4b9db4', '#849157'];
-const str = value => value == null ? '' : String(value);
-const label = value => str(value) || '(Blank)';
-const normalized = value => str(value).trim().toLowerCase();
-const badgeClass = value => normalized(value).replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
-function statusColor(value) {
-  const key = normalized(value);
-  if (STATUS_COLORS[key]) return STATUS_COLORS[key];
-  let hash = 0;
-  for (let i = 0; i < key.length; i += 1) hash = (hash * 31 + key.charCodeAt(i)) % 360;
-  return `hsl(${hash}, 58%, 78%)`;
-}
-function textColorForBg(color) {
-  if (!color.startsWith('#')) return '#1f2937';
-  const r = parseInt(color.slice(1, 3), 16), g = parseInt(color.slice(3, 5), 16), b = parseInt(color.slice(5, 7), 16);
-  return (r * 299 + g * 587 + b * 114) / 1000 > 155 ? '#111827' : '#ffffff';
-}
-async function api(url, options = {}) {
-  const response = await fetch(url, options);
-  if (!response.ok) { let body; try { body = await response.json(); } catch { body = {}; } throw Error(body.error || `Request failed (${response.status})`); }
-  const body = await response.json();
-  if (body.clock) body.clock.receivedAt = performance.now();
-  return body;
-}
-function saveBlob(blob, filename) {
-  const url = URL.createObjectURL(blob), a = document.createElement('a');
-  a.href = url; a.download = filename; a.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
-}
-function csvDownload(rows, columns, name) {
-  const cell = value => '"' + str(value).replaceAll('"', '""') + '"';
-  saveBlob(new Blob(['\ufeff' + [columns, ...rows.map(row => columns.map(c => row[c]))].map(row => row.map(cell).join(',')).join('\r\n')], {type: 'text/csv;charset=utf-8'}), name);
-}
-function matches(row, filters, except) {
-  return Object.entries(filters).every(([column, filter]) => {
-    if (column === except) return true;
-    const value = str(row[column]);
-    if (filter.values && !filter.values.includes(value)) return false;
-    if (!filter.operator || filter.operator === 'none') return true;
-    const query = filter.query || '';
-    if (filter.operator === 'contains') return value.toLowerCase().includes(query.toLowerCase());
-    if (filter.operator === 'excludes') return !value.toLowerCase().includes(query.toLowerCase());
-    if (filter.operator === 'equals') return value === query;
-    if (filter.operator === 'blank') return !value;
-    if (filter.operator === 'notblank') return !!value;
-    const parse = v => v.trim() === '' ? NaN : Number.isFinite(Number(v)) ? Number(v) : Date.parse(v);
-    const a = parse(value), b = parse(query);
-    if (!Number.isFinite(a) || !Number.isFinite(b)) return false;
-    return filter.operator === 'gt' ? a > b : filter.operator === 'lt' ? a < b : a >= b && a <= parse(filter.end || '');
-  });
-}
-function IconButton({title, children, ...props}) { return <button className="icon-button" title={title} aria-label={title} {...props}>{children}</button>; }
-
-function SideDrawer({ title, rows, columns, onClose }) {
-  if (!title) return null;
-  return (
-    <div className="drawer-backdrop" onClick={onClose}>
-      <div className="side-drawer" onClick={e => e.stopPropagation()}>
-        <div className="drawer-header">
-          <div>
-            <h3>{title}</h3>
-            <p>{rows.length.toLocaleString()} matching records</p>
-          </div>
-          <IconButton title="Close drawer" onClick={onClose}><X size={19}/></IconButton>
-        </div>
-        <div className="drawer-body">
-          <DataTable rows={rows} columns={columns} filters={{}} openFilter={() => {}} filterable={false} name={title} onClose={onClose} />
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function MaximizedModal({ title, subtitle, children, onClose }) {
-  return (
-    <div className="modal-backdrop" onClick={onClose}>
-      <div className="maximized-modal" onClick={e => e.stopPropagation()}>
-        <div className="modal-header">
-          <div>
-            <h3>{title}</h3>
-            {subtitle && <p style={{ fontSize: 11, color: '#64748b', marginTop: 2 }}>{subtitle}</p>}
-          </div>
-          <IconButton title="Close modal" onClick={onClose}><X size={20}/></IconButton>
-        </div>
-        <div className="modal-body">
-          {children}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-
-function FilterPanel({column, rows, filters, setFilters, close}) {
-  const [search, setSearch] = useState('');
-  const current = filters[column] || {};
-  const unique = useMemo(() => {
-    const counts = new Map();
-    rows.filter(row => matches(row, filters, column)).forEach(row => {const v = str(row[column]); counts.set(v, (counts.get(v) || 0) + 1);});
-    return [...counts].sort((a,b) => a[0].localeCompare(b[0], undefined, {numeric: true}));
-  }, [column, rows, filters]);
-  const visible = unique.filter(([v]) => label(v).toLowerCase().includes(search.toLowerCase()));
-  function update(patch) {setFilters({...filters, [column]: {...current, ...patch}});}
-  function toggle(value) {const chosen = current.values ?? unique.map(([v]) => v); update({values: chosen.includes(value) ? chosen.filter(v => v !== value) : [...chosen, value]});}
-  return <aside className="filter-panel" aria-label="Column filters">
-    <div className="panel-head"><div><span className="eyebrow">COLUMN FILTER</span><h3>{column}</h3></div><IconButton title="Close filter" onClick={close}><X size={18}/></IconButton></div>
-    <label>Condition<select value={current.operator || 'none'} onChange={e => update({operator: e.target.value})}>
-      <option value="none">Any value</option><option value="contains">Contains</option><option value="excludes">Does not contain</option><option value="equals">Equals</option><option value="blank">Is blank</option><option value="notblank">Is not blank</option><option value="gt">Greater than / after</option><option value="lt">Less than / before</option><option value="between">Between (inclusive)</option>
-    </select></label>
-    {current.operator && !['none','blank','notblank'].includes(current.operator) && <input aria-label="Filter value" placeholder="Value, number or YYYY-MM-DD" value={current.query || ''} onChange={e => update({query: e.target.value})}/>}
-    {current.operator === 'between' && <input aria-label="Filter end value" placeholder="End value" value={current.end || ''} onChange={e => update({end: e.target.value})}/>}
-    <div className="unique-title"><h4>Unique values <span>{unique.length}</span></h4><div className="inline"><IconButton title="Download unique values" onClick={() => csvDownload(unique.map(([v,count])=>({[column]:v,Count:count})),[column,'Count'],`${column}-values.csv`)}><ArrowDownToLine size={16}/></IconButton><IconButton title="Print unique values" onClick={()=>window.print()}><Printer size={16}/></IconButton></div></div>
-    <input aria-label="Search unique values" placeholder="Search values" value={search} onChange={e=>setSearch(e.target.value)}/>
-    <div className="selection-actions"><button onClick={()=>update({values:undefined})}>Select all</button><button onClick={()=>update({values:[]})}>Select none</button><button onClick={()=>{const next={...filters};delete next[column];setFilters(next);}}>Reset column</button></div>
-    <div className="unique-values">{visible.map(([v,count])=><label key={v} className="check-row"><input type="checkbox" checked={!current.values || current.values.includes(v)} onChange={()=>toggle(v)}/><span>{label(v)}</span><small>{count.toLocaleString()}</small></label>)}{!visible.length && <p className="muted">No matching values.</p>}</div>
-    <div className="print-values"><h2>{column} — Unique values</h2>{visible.map(([v,count])=><p key={v}>{label(v)}: {count}</p>)}</div>
-  </aside>;
-}function StatusReport({rows}) {
-  const counts=new Map();
-  rows.forEach(row=>{const raw=str(row.Status).trim()||'(Blank)';const key=raw.toLowerCase();const entry=counts.get(key)||{name:raw,count:0};entry.count++;counts.set(key,entry);});
-  return <section className="status-report"><div className="section-heading"><h2>Status Report</h2><span className="row-tally">{counts.size} statuses</span></div><div className="status-report-scroll"><table className="status-report-table"><thead><tr><th>Status</th><th>Orders</th><th>Share</th></tr></thead><tbody>{[...counts.values()].sort((a,b)=>b.count-a.count).map(item=>{const bg=statusColor(item.name);return <tr key={item.name} style={{backgroundColor:bg,color:textColorForBg(bg)}}><td>{item.name}</td><td>{item.count.toLocaleString()}</td><td>{rows.length?(item.count/rows.length*100).toFixed(1):'0.0'}%</td></tr>;})}</tbody></table></div></section>;
-}
-
-function DataTable({rows, columns, filters, openFilter, name, filterable=true, onClose}) {
-  const [page, setPage] = useState(0), [size, setSize] = useState(50), [sort, setSort] = useState(null);
-  useEffect(()=>setPage(0),[rows,size]);
-  const sorted = useMemo(()=>sort ? [...rows].sort((a,b)=>str(a[sort.column]).localeCompare(str(b[sort.column]),undefined,{numeric:true})*(sort.desc?-1:1)) : rows,[rows,sort]);
-  const pages = Math.max(1,Math.ceil(rows.length/size)), safePage = Math.min(page,pages-1);
-  return <section className="table-section"><div className="section-heading"><h2>{name}</h2><div className="inline"><button className="secondary" disabled={!rows.length} onClick={()=>csvDownload(sorted,columns,`${name}-filtered.csv`)}><ArrowDownToLine size={16}/>Filtered CSV</button>{onClose&&<IconButton title="Close chart details" onClick={onClose}><X size={17}/></IconButton>}</div></div>
-    <div className="table-scroll"><table><thead><tr>{columns.map(c=><th key={c}><div className="th-inner">{filterable?<button className={filters[c]?'column-button active-filter':'column-button'} title={`Filter ${c} and view unique values`} onClick={()=>openFilter(c)}>{c}<Filter size={13}/></button>:<span className="column-label">{c}</span>}<IconButton title={`Sort ${c}`} onClick={()=>setSort({column:c,desc:sort?.column===c?!sort.desc:false})}>{sort?.column===c&&sort.desc?<ArrowDown size={13}/>:<ArrowUp size={13}/>}</IconButton></div></th>)}</tr></thead><tbody>{sorted.slice(safePage*size,(safePage+1)*size).map((row,i)=><tr key={i}>{columns.map(c=><td key={c} title={str(row[c])}>{c==='Change'||c==='Comparison Status'?<span className={`badge ${badgeClass(row[c])}`}>{c==='Comparison Status'&&row[c]==='Missing'?'Missing Previews':str(row[c])}</span>:label(row[c])}</td>)}</tr>)}</tbody></table>{!rows.length&&<div className="table-empty">No matching rows</div>}</div>
-    <footer className="table-footer"><span>{rows.length.toLocaleString()} rows</span><div className="inline"><label>Rows <select aria-label="Rows per page" value={size} onChange={e=>setSize(Number(e.target.value))}>{[25,50,100,250].map(n=><option key={n}>{n}</option>)}</select></label><IconButton title="Previous page" disabled={safePage===0} onClick={()=>setPage(safePage-1)}><ChevronLeft size={16}/></IconButton><span>{safePage+1} / {pages}</span><IconButton title="Next page" disabled={safePage+1===pages} onClick={()=>setPage(safePage+1)}><ChevronRight size={16}/></IconButton></div></footer>
-  </section>;
-}
-
-function completionStatus(row) { return row; }
-
-const DAILY_SERIES = [
-  {name:'Today Orders',color:'#147d72'},
-  {name:'Not in latest preview',color:'#bd6268'},
-  {name:'Newly Orders',color:'#d79a32'},
-  {name:'Unchanged',color:'#596cc0'},
-  {name:'Awaiting for Clarification',color:STATUS_COLORS['awaiting for clarification']}
-];
-
-function PeriodOrdersChart({history, selected, onSelect, period, series, title, label: chartLabel}) {
-  const [expanded,setExpanded]=useState(false);
-  const sorted=useMemo(()=>[...history].sort((a,b)=>a[period].localeCompare(b[period])),[history,period]);
-  const selectedIndex=Math.max(0,sorted.findIndex(item=>item[period]===selected));
-  const start=Math.max(0,Math.min(selectedIndex-2,sorted.length-3));
-  const data=sorted.slice(start,start+3);
-  const formatPeriod=value=>{
-    const date=new Date(period==='Date'?`${value}T12:00:00`:`${value}-01T12:00:00`);
-    return Number.isNaN(date.getTime())?value:date.toLocaleDateString('en-US',period==='Date'?{month:'short',day:'numeric'}:{month:'short',year:'numeric'});
-  };
-  const renderChart=(large=false)=><>
-    <div className="chart-period-controls">
-      <button className="secondary" disabled={start===0} onClick={()=>onSelect(sorted[Math.max(0,start-1)][period])}><ChevronLeft size={15}/>Earlier</button>
-      <span>{data.length?`${formatPeriod(data[0][period])} – ${formatPeriod(data.at(-1)[period])}`:''}</span>
-      <button className="secondary" disabled={start+3>=sorted.length} onClick={()=>onSelect(sorted[Math.min(sorted.length-1,start+5)][period])}>Later<ChevronRight size={15}/></button>
-    </div>
-    <div className="daily-chart-legend">{series.map(item=><span key={item.name}><i style={{background:item.color}}/>{item.name}</span>)}</div>
-    <div className="daily-chart-scroll"><div style={{height:large?460:340,minWidth:Math.max(620,data.length*series.length*48)}}>
-      <ResponsiveContainer width="100%" height="100%">
-        <BarChart data={data} margin={{top:32,right:24,bottom:12,left:4}} barGap={5} barCategoryGap="12%">
-          <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e9edee"/>
-          <XAxis dataKey={period} tick={{fontSize:12}} tickFormatter={formatPeriod} interval={0}/>
-          <YAxis allowDecimals={false} tick={{fontSize:12}} width={52} domain={[0,max=>Math.max(5,Math.ceil(max*1.15))]}/>
-          <Tooltip cursor={{fill:'#f0f5f3'}} formatter={(value,name,item)=>period==='Month'?`${Number(value).toLocaleString()} (${monthlyPercentage(item.payload,name)})`:Number(value).toLocaleString()}/>
-          {series.map(item=><Bar key={item.name} dataKey={item.name} fill={item.color} radius={[3,3,0,0]} maxBarSize={40} minPointSize={value=>Number(value)>0?3:0} isAnimationActive={false} cursor="pointer" onClick={entry=>onSelect(entry[period]||entry.payload?.[period])}>
-            {data.map(row=><Cell key={row[period]} fillOpacity={row[period]===selected?1:0.8}/>)}
-            <LabelList dataKey={item.name} position="top" fill="#233b37" fontSize={11} fontWeight={600} formatter={value=>Number(value)>0?Number(value).toLocaleString():''}/>
-          </Bar>)}
-        </BarChart>
-      </ResponsiveContainer>
-    </div></div>
-    <p className="chart-hint">Values appear above each bar. Zero values have no bar. Select a bar or use Earlier / Later to change the period.</p>
-  </>;
-  return <section className="daily-chart" aria-label={chartLabel}>
-    <div className="card-head"><h3>{title}</h3><IconButton title={`Expand ${chartLabel.toLowerCase()}`} onClick={()=>setExpanded(true)}><Maximize2 size={16}/></IconButton></div>
-    {data.length?renderChart():<div className="table-empty">No orders</div>}
-    {expanded&&<MaximizedModal title={title} onClose={()=>setExpanded(false)}>{renderChart(true)}</MaximizedModal>}
-  </section>;
-}
-function DailyOrdersChart({history, selectedDate, onSelect}) {
-  return <PeriodOrdersChart history={history} selected={selectedDate} onSelect={onSelect} period="Date" series={DAILY_SERIES} title="Daily Orders by Date" label="Daily orders bar chart"/>;
-}
-
-function DailyOrders({preview, running}) {
-  const [history,setHistory]=useState([]), [error,setError]=useState(''), [date,setDate]=useState(''), [search,setSearch]=useState('');
-  const [loading,setLoading]=useState(true);
-  useEffect(()=>{let active=true;setLoading(true);api(`/api/daily-orders${preview.id?`?preview_id=${preview.id}`:''}`).then(data=>{if(active){setHistory(data.rows);setDate(data.selected_date||'');setSearch('');setError('');}}).catch(e=>{if(active){setHistory([]);setError(e.message);}}).finally(()=>{if(active)setLoading(false);});return()=>{active=false;};},[preview.id,running]);
-  const selectedDay=history.find(day=>day.Date===date)||history[0];
-  const columns=selectedDay?.columns||[];
-  const rows=(selectedDay?.rows||[]).filter(row=>!search||columns.some(column=>str(row[column]).toLowerCase().includes(search.toLowerCase())));
-  const groups=[
-    ['Today Orders',rows],
-    ['Not in latest preview',rows.filter(row=>selectedDay?.missing_ids.includes(str(row['Order Number']).trim()))],
-    ['Newly Orders',rows.filter(row=>selectedDay?.new_ids.includes(str(row['Order Number']).trim()))],
-    ['Unchanged',rows.filter(row=>selectedDay?.unchanged_ids.includes(str(row['Order Number']).trim()))],
-    ['Awaiting for Clarification',rows.filter(row=>normalized(row['Task Status'] ?? row.Status)==='awaiting for clarification')]
-  ];
-  const names=['Today Orders','Not in latest preview','Newly Orders','Unchanged','Awaiting for Clarification'];
-  return <section className="daily-orders">
-    {error&&<div className="notice error">{error}</div>}
-    {loading?<div className="loading"><LoaderCircle className="spin"/>Loading daily orders...</div>:<>
-      <div className="section-heading"><h2>Daily capture history</h2><label>Date<select aria-label="Daily orders date" value={selectedDay?.Date||''} onChange={e=>{setDate(e.target.value);setSearch('');}}>{history.map(day=><option key={day.Date}>{day.Date}</option>)}</select></label></div>
-      <div className="metrics">{names.map((name,index)=><div className={`metric ${['green','red','amber','gray','purple'][index]}`} key={name}><span>{name}</span><strong>{selectedDay?.[name]??0}</strong></div>)}</div>
-      <DailyOrdersChart history={history} selectedDate={selectedDay?.Date} onSelect={value=>{if(value){setDate(value);setSearch('');}}}/>
-      <div className="table-scroll"><table><thead><tr>{['Date','Previews',...names].map(name=><th key={name}>{name}</th>)}</tr></thead><tbody>{history.map(day=><tr key={day.Date}><td><button className="text-button" onClick={()=>{setDate(day.Date);setSearch('');}}>{day.Date}</button></td><td>{day.Previews.join(', ')}</td>{names.map(name=><td key={name}>{day[name]}</td>)}</tr>)}</tbody></table></div>
-      <div className="filter-toolbar"><div className="search-input"><Search size={16}/><input aria-label="Search daily orders" placeholder="Search all columns" value={search} onChange={e=>setSearch(e.target.value)}/></div></div>
-      {selectedDay?groups.map(([name,items])=><DataTable key={name} rows={items} columns={columns} filters={{}} openFilter={()=>{}} filterable={false} name={`${name} · ${items.length}`}/>):<div className="table-empty">No daily orders</div>}
-    </>}
-  </section>;
-}
-
-const MONTHLY_SERIES = [
-  {name:'Month Orders',color:'#147d72'},
-  {name:'Completed Orders',color:'#bd6268'},
-  {name:'Unchanged',color:'#596cc0'},
-  {name:'Awaiting for Clarification',color:STATUS_COLORS['awaiting for clarification']},
-  {name:'SLA On Time',color:'#30874b'},
-  {name:'SLA Missed',color:'#d79a32'}
-];
-
-function monthlyPercentage(report, name) {
-  const total=name.startsWith('SLA ')?(report?.['SLA On Time']||0)+(report?.['SLA Missed']||0):report?.['Month Orders'];
-  return `${total?((report?.[name]||0)/total*100).toFixed(1):'0.0'}%`;
-}
-
-function MonthlyOrdersChart({history, selectedMonth, onSelect}) {
-  return <PeriodOrdersChart history={history} selected={selectedMonth} onSelect={onSelect} period="Month" series={MONTHLY_SERIES} title="Monthly Orders by Month" label="Monthly orders bar chart"/>;
-}
-
-const SLA_COLUMNS=['Order Number','Product Group','Product','In Time','Out Time','SLA Expiration','Free Site'];
-const slaRowKey=row=>JSON.stringify([row['Order Number'],row.completion_date]);
-
-function SlaOrdersTable({rows, statusFilter, onStatusFilter, onSave, running}) {
-  const [search,setSearch]=useState(''), [group,setGroup]=useState(''), [page,setPage]=useState(0);
-  const [editing,setEditing]=useState(null), [draft,setDraft]=useState(''), [saving,setSaving]=useState(false);
-  const [error,setError]=useState(''), [message,setMessage]=useState('');
-  const [selected,setSelected]=useState({}), [bulkStatus,setBulkStatus]=useState('');
-  const pageCheckbox=useRef(null);
-  const filtered=rows.filter(row=>(!statusFilter||row['Free Site']===statusFilter)&&(!group||row['Product Group']===group)&&
-    (!search||SLA_COLUMNS.some(column=>str(row[column]).toLowerCase().includes(search.toLowerCase()))));
-  const pages=Math.max(1,Math.ceil(filtered.length/25)), currentPage=Math.min(page,pages-1);
-  const pageRows=filtered.slice(currentPage*25,(currentPage+1)*25);
-  const selectable=filtered.filter(row=>row['Order Number']);
-  const selectablePage=pageRows.filter(row=>row['Order Number']);
-  const selectedRows=Object.values(selected), selectedCount=selectedRows.length;
-  const checkedPage=selectablePage.filter(row=>selected[slaRowKey(row)]).length;
-  const allPage=selectablePage.length>0&&checkedPage===selectablePage.length;
-  useEffect(()=>{setPage(0);setSelected({});setBulkStatus('');},[search,group,statusFilter]);
-  useEffect(()=>{if(pageCheckbox.current)pageCheckbox.current.indeterminate=checkedPage>0&&!allPage;},[checkedPage,allPage]);
-  const selectRows=(items,checked)=>{
-    setEditing(null);setError('');setMessage('');
-    setSelected(previous=>{const next={...previous};items.forEach(row=>{if(checked)next[slaRowKey(row)]=row;else delete next[slaRowKey(row)];});return next;});
-  };
-  const save=async(items,status)=>{
-    setSaving(true);setError('');setMessage('');
-    try{const result=await onSave(items,status);setMessage(result);setEditing(null);setSelected({});setBulkStatus('');}
-    catch(e){setError(e.message);}
-    finally{setSaving(false);}
-  };
-  return <section className="sla-orders" aria-label="SLA order details">
-    <div className="section-heading"><div><h3>SLA order details</h3><p className="muted">Edit an order, or select several orders to update their SLA status together.</p></div></div>
-    {message&&<div className="notice success" role="status"><Check size={16}/>{message}</div>}
-    {error&&<div className="notice error" role="alert">{error}</div>}
-    {editing&&<div className="sla-editor" role="group" aria-label={`Edit SLA for order ${editing['Order Number']}`}>
-      <div><strong>Order {editing['Order Number']}</strong><p className="muted">{editing['Product Group']} · Out Time: {editing['Out Time']}</p></div>
-      <label>Free Site (SLA status)<select aria-label="Edit Free Site" value={draft} disabled={saving} onChange={e=>setDraft(e.target.value)}><option>On Time</option><option>Missing</option></select></label>
-      <button className="primary" onClick={()=>save(editing,draft)} disabled={saving||running||draft===editing['Free Site']}>{saving?<LoaderCircle size={16} className="spin"/>:<Check size={16}/>} {saving?'Saving…':'Save SLA'}</button>
-      <button className="secondary" disabled={saving} onClick={()=>{setEditing(null);setError('');}}>Cancel</button>
-    </div>}
-    {running&&<p className="muted">SLA editing is available when the current sync or extraction finishes.</p>}
-    <div className="filter-toolbar">
-      <div className="search-input"><Search size={16}/><input aria-label="Search SLA orders" placeholder="Search order or product" value={search} disabled={saving} onChange={e=>setSearch(e.target.value)}/></div>
-      <select aria-label="Filter SLA status" value={statusFilter} disabled={saving} onChange={e=>onStatusFilter(e.target.value)}><option value="">All SLA results</option><option value="On Time">SLA On Time</option><option value="Missing">SLA Missed</option></select>
-      <select aria-label="Filter SLA product group" value={group} disabled={saving} onChange={e=>setGroup(e.target.value)}><option value="">All products</option><option>Full Title</option><option>Remaining Products</option></select>
-      <span className="row-tally">{filtered.length} / {rows.length} orders</span>
-    </div>
-    {selectedCount>0&&<div className="sla-bulk-editor" role="group" aria-label="Update selected SLA orders">
-      <div><strong>{selectedCount} orders selected</strong><p className="muted">Selections carry across pages. Changing filters clears the selection.</p>
-        {selectedCount<selectable.length&&<button className="text-button" disabled={saving||running} onClick={()=>selectRows(selectable,true)}>Select all {selectable.length} matching orders</button>}
-      </div>
-      <label>Set selected orders to<select aria-label="Bulk SLA status" value={bulkStatus} disabled={saving} onChange={e=>setBulkStatus(e.target.value)}><option value="">Choose status</option><option>On Time</option><option>Missing</option></select></label>
-      <button className="primary" disabled={saving||running||!bulkStatus} onClick={()=>save(selectedRows,bulkStatus)}>{saving?<LoaderCircle size={16} className="spin"/>:<Check size={16}/>} {saving?'Saving…':`Update ${selectedCount} selected`}</button>
-      <button className="secondary" disabled={saving} onClick={()=>{setSelected({});setBulkStatus('');setError('');}}>Clear selection</button>
-    </div>}
-    <div className="table-scroll"><table aria-label="SLA orders"><thead><tr><th className="sla-check"><input ref={pageCheckbox} type="checkbox" aria-label="Select all orders on this page" checked={allPage} disabled={saving||running||!selectablePage.length} onChange={e=>selectRows(selectablePage,e.target.checked)}/></th>{SLA_COLUMNS.map(column=><th key={column}>{column==='Free Site'?'Free Site / SLA':column}</th>)}<th>Action</th></tr></thead>
-      <tbody>{pageRows.map(row=><tr key={slaRowKey(row)} className={selected[slaRowKey(row)]?'sla-selected':''}>
-        <td className="sla-check"><input type="checkbox" aria-label={`Select order ${row['Order Number']}`} checked={!!selected[slaRowKey(row)]} disabled={saving||running||!row['Order Number']} onChange={e=>selectRows([row],e.target.checked)}/></td>
-        {SLA_COLUMNS.map(column=><td key={column} title={str(row[column])}>{column==='Free Site'?<span className={`sla-badge ${row[column]==='On Time'?'on-time':'missed'}`}>{row[column]}</span>:str(row[column])||'—'}</td>)}
-        <td><button className="secondary" aria-label={`Edit SLA for order ${row['Order Number']}`} disabled={saving||running||!row['Order Number']} onClick={()=>{setSelected({});setBulkStatus('');setEditing(row);setDraft(row['Free Site']);setError('');setMessage('');}}>Edit</button></td>
-      </tr>)}</tbody></table>{!filtered.length&&<div className="table-empty">No matching SLA orders</div>}</div>
-    <div className="table-footer"><span>Page {currentPage+1} of {pages}</span><div className="inline"><button className="secondary" aria-label="Previous SLA page" disabled={currentPage===0} onClick={()=>setPage(currentPage-1)}><ChevronLeft size={16}/>Previous</button><button className="secondary" aria-label="Next SLA page" disabled={currentPage>=pages-1} onClick={()=>setPage(currentPage+1)}>Next<ChevronRight size={16}/></button></div></div>
-  </section>;
-}
-
-function MonthlyOrders({preview,running}) {
-  const [history,setHistory]=useState([]), [error,setError]=useState(''), [month,setMonth]=useState(''), [search,setSearch]=useState('');
-  const [loading,setLoading]=useState(true);
-  const [slaFilter,setSlaFilter]=useState(''), [refreshId,setRefreshId]=useState(0), [saving,setSaving]=useState(false);
-  const savePending=useRef(false), reportVersion=useRef(0);
-  useEffect(()=>{
-    let active=true, busy=false;
-    setLoading(true);
-    const refresh=async()=>{
-      if(busy||savePending.current)return;
-      busy=true;
-      const version=reportVersion.current;
-      try{
-        const data=await api('/api/monthly-orders');
-        if(active&&version===reportVersion.current){setHistory(data.rows);setError(data.sla_error||'');}
-      }catch(e){if(active&&version===reportVersion.current)setError(e.message);}
-      finally{busy=false;if(active)setLoading(false);}
-    };
-    refresh();
-    const timer=setInterval(refresh,30000);
-    return()=>{active=false;clearInterval(timer);};
-  },[preview?.id,refreshId]);
-
-  const saveSla=async(row,status)=>{
-    savePending.current=true;setSaving(true);reportVersion.current++;
-    try{
-      const order=item=>({order_number:item['Order Number'],completion_date:item.completion_date,expected_status:item['Free Site']});
-      const bulk=Array.isArray(row);
-      const result=await api(bulk?'/api/sla-comments/bulk':'/api/sla-comments',{method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify(bulk?{orders:row.map(order),status}:{...order(row),status})});
-      reportVersion.current++;setHistory(result.rows);setError('');
-      return result.message;
-    }finally{savePending.current=false;setSaving(false);}
-  };
-
-  const selectedMonth=history.find(m=>m.Month===month)||history[0];
-  const columns=selectedMonth?.columns||[];
-  const rows=(selectedMonth?.rows||[]).filter(row=>!search||columns.some(column=>str(row[column]).toLowerCase().includes(search.toLowerCase())));
-  const groups=[
-    ['Month Orders',rows],
-    ['Completed Orders',rows.filter(row=>selectedMonth?.completed_ids.includes(str(row['Order Number']).trim()))],
-    ['Unchanged',rows.filter(row=>selectedMonth?.unchanged_ids.includes(str(row['Order Number']).trim()))],
-    ['Awaiting for Clarification',rows.filter(row=>normalized(row['Task Status'] ?? row.Status)==='awaiting for clarification')]
-  ];
-  const names=MONTHLY_SERIES.map(series=>series.name);
-
-  return <section className="daily-orders">
-    {error&&<div className="notice error">{error}</div>}
-    {loading?<div className="loading"><LoaderCircle className="spin"/>Loading monthly orders...</div>:<>
-      <div className="section-heading"><h2>Monthly capture history</h2><label>Month<select aria-label="Monthly orders date" disabled={saving} value={selectedMonth?.Month||''} onChange={e=>{setMonth(e.target.value);setSearch('');}}>{history.map(m=><option key={m.Month} value={m.Month}>{m.MonthLabel || m.Month}</option>)}</select></label></div>
-      <div className="metrics">{names.slice(0,4).map((name,index)=><div className={`metric ${['green','red','gray','purple'][index]}`} key={name}><span>{name}</span><strong>{selectedMonth?.[name]??0}</strong><small>{monthlyPercentage(selectedMonth,name)}</small></div>)}</div>
-      <div className="section-heading"><h2>SLA COMMENTS</h2><button className="secondary" disabled={saving} onClick={()=>setRefreshId(value=>value+1)}>Refresh SLA</button></div>
-      <div className="metrics sla-metrics">{names.slice(4).map(name=>{const value=name==='SLA On Time'?'On Time':'Missing';return <button className={`metric sla-metric ${value==='On Time'?'green':'amber'}`} key={name} disabled={saving} aria-pressed={slaFilter===value} onClick={()=>setSlaFilter(slaFilter===value?'':value)}><span>{name}</span><strong>{selectedMonth?.[name]??0}</strong><small>{monthlyPercentage(selectedMonth,name)}</small></button>;})}</div>
-      <SlaOrdersTable key={selectedMonth?.Month||'empty'} rows={selectedMonth?.sla_rows||[]} statusFilter={slaFilter} onStatusFilter={setSlaFilter} onSave={saveSla} running={running}/>
-      <MonthlyOrdersChart history={history} selectedMonth={selectedMonth?.Month} onSelect={value=>{if(value){setMonth(value);setSearch('');}}}/>
-      <div className="table-scroll"><table><thead><tr>{['Month','Previews',...names].map(name=><th key={name}>{name}</th>)}</tr></thead><tbody>{history.map(m=><tr key={m.Month}><td><button className="text-button" onClick={()=>{setMonth(m.Month);setSearch('');}}>{m.MonthLabel || m.Month}</button></td><td>{m.Previews.join(', ')}</td>{names.map(name=><td key={name}>{`${m[name]??0} (${monthlyPercentage(m,name)})`}</td>)}</tr>)}</tbody></table></div>
-      <div className="filter-toolbar"><div className="search-input"><Search size={16}/><input aria-label="Search monthly orders" placeholder="Search all columns" value={search} onChange={e=>setSearch(e.target.value)}/></div></div>
-      {selectedMonth?groups.map(([name,items])=><DataTable key={name} rows={items} columns={columns} filters={{}} openFilter={()=>{}} filterable={false} name={`${name} · ${items.length}`}/>):<div className="table-empty">No monthly orders</div>}
-    </>}
-  </section>;
-}
-
+import {EMPTY, DEFAULT_IGNORE, colors, str, label, normalized, badgeClass, STATUS_COLORS, statusColor, textColorForBg, api, saveBlob, csvDownload, matches, IconButton} from './workspaceUtils';
+const OverviewDashboard = React.lazy(() => import('./WorkspaceViews').then(module => ({default: module.OverviewDashboard})));
+const AdvancedChart = React.lazy(() => import('./WorkspaceViews').then(module => ({default: module.AdvancedChart})));
+const SideDrawer = React.lazy(() => import('./WorkspaceViews').then(module => ({default: module.SideDrawer})));
+const DataTable = React.lazy(() => import('./WorkspaceViews').then(module => ({default: module.DataTable})));
+const FilterPanel = React.lazy(() => import('./WorkspaceViews').then(module => ({default: module.FilterPanel})));
+const DailyOrders = React.lazy(() => import('./WorkspaceViews').then(module => ({default: module.DailyOrders})));
+const MonthlyOrders = React.lazy(() => import('./WorkspaceViews').then(module => ({default: module.MonthlyOrders})));
 function formatTime12(time24) {
   if (!time24) return '';
   const [hStr, mStr] = time24.split(':');
@@ -382,8 +50,15 @@ const indianDateTime = new Intl.DateTimeFormat('en-IN', {
   timeZone:'Asia/Kolkata', day:'2-digit', month:'short', year:'numeric',
   hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:true
 });
+const WEEK_DAYS=['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
+const ALL_DAYS=WEEK_DAYS.map((_,day)=>day);
+const WEEKDAYS=[0,1,2,3,4];
+const WEEKENDS=[5,6];
+const sameDays=(left,right)=>left.length===right.length&&left.every((day,index)=>day===right[index]);
+const dayPreset=days=>sameDays(days,ALL_DAYS)?'all':sameDays(days,WEEKDAYS)?'weekdays':sameDays(days,WEEKENDS)?'weekends':'custom';
+const reportCount=(report,key)=>report?.[`${key}_count`]??(Array.isArray(report?.[key])?report[key].length:Number(report?.[key])||0);
 
-function TriggerClock({schedule, clock}) {
+function TriggerClock({schedule, clock, onClearHistory, clearingHistory}) {
   const [elapsed,setElapsed]=useState(()=>performance.now());
   useEffect(()=>{const timer=setInterval(()=>setElapsed(performance.now()),1000);return()=>clearInterval(timer);},[]);
   if (!clock?.synchronized || clock.epoch_ms == null) return <div className="trigger-clock"><span>Indian time (IST)</span><strong data-testid="indian-clock">Synchronizing Indian time…</strong><span>Scheduled runs wait for network time.</span></div>;
@@ -392,29 +67,64 @@ function TriggerClock({schedule, clock}) {
   const day=new Date(now+offset).toISOString().slice(0,10);
   const midnight=Date.parse(`${day}T00:00:00+05:30`);
   const triggered=schedule?.last_triggered_date===day?(schedule.triggered_today||[]):[];
-  const candidates=(schedule?.times||[]).map(time=>{
-    const [hour,minute]=time.split(':').map(Number);
-    const timestamp=midnight+(hour*60+minute)*60000;
-    return triggered.includes(time)?timestamp+86400000:timestamp;
-  });
+  const days=schedule?.days?.length?schedule.days:ALL_DAYS;
+  const weekday=(new Date(now+offset).getUTCDay()+6)%7;
+  const candidates=[];
+  for(let dayOffset=0;dayOffset<=7;dayOffset++){
+    if(!days.includes((weekday+dayOffset)%7))continue;
+    for(const time of schedule?.times||[]){
+      if(dayOffset===0&&triggered.includes(time))continue;
+      const [hour,minute]=time.split(':').map(Number);
+      candidates.push(midnight+dayOffset*86400000+(hour*60+minute)*60000);
+    }
+  }
   const next=candidates.length?Math.min(...candidates):null;
   return <div className="trigger-clock">
     <span>Indian time (IST) · Network synchronized</span>
     <strong data-testid="indian-clock">{indianDateTime.format(now)} IST</strong>
     <span data-testid="next-trigger">{schedule?.enabled&&next?
       `Next run: ${indianDateTime.format(next)} IST${next<now?' (pending)':''}`:'Schedule paused'}</span>
+    {schedule?.last_attempt&&<div className="trigger-history-row"><span>Last attempt: {indianDateTime.format(new Date(schedule.last_attempt))} · {schedule.last_status}</span><IconButton title="Clear last attempt from this panel" disabled={clearingHistory} onClick={()=>onClearHistory('attempt')}><X size={13}/></IconButton></div>}
+    {schedule?.last_success?<div className="trigger-history-row"><span>Last success: {indianDateTime.format(new Date(schedule.last_success))} IST</span><IconButton title="Clear last success from this panel" disabled={clearingHistory} onClick={()=>onClearHistory('success')}><X size={13}/></IconButton></div>:!schedule?.cleared_success_at&&<span>Last success: No successful scheduled run recorded</span>}
   </div>;
 }
 
+function StatusReport({rows}) {
+  const counts=new Map();
+  rows.forEach(row=>{const raw=str(row.Status).trim()||'(Blank)';const key=raw.toLowerCase();const entry=counts.get(key)||{name:raw,count:0};entry.count++;counts.set(key,entry);});
+  return <section className="status-report"><div className="section-heading"><h2>Status Report</h2><span className="row-tally">{counts.size} statuses</span></div><div className="status-report-scroll"><FilterableTable className="status-report-table"><thead><tr><th>Status</th><th>Orders</th><th>Share</th></tr></thead><tbody>{[...counts.values()].sort((a,b)=>b.count-a.count).map(item=>{const bg=statusColor(item.name);return <tr key={item.name} style={{backgroundColor:bg,color:textColorForBg(bg)}}><td>{item.name}</td><td>{item.count.toLocaleString()}</td><td>{rows.length?(item.count/rows.length*100).toFixed(1):'0.0'}%</td></tr>;})}</tbody></FilterableTable></div></section>;
+}
+
+
 function App() {
-  const [state,setState]=useState({previews:[],job:{running:false,stage:'Ready'}}), [selected,setSelected]=useState(null), [preview,setPreview]=useState(EMPTY), [view,setView]=useState('sheets');
+  const productionReportSession=useRef({});
+  const [state,setState]=useState({previews:[],job:{running:false,stage:'Ready'}}), [selected,setSelected]=useState(null), [preview,setPreview]=useState(EMPTY), [view,setView]=useState('sla');
+  const [reportMode,setReportMode]=useState('tracker'), [reportRevision,setReportRevision]=useState(0), [reportImportOpen,setReportImportOpen]=useState(false);
   const [previous,setPrevious]=useState(''), [diff,setDiff]=useState(null), [keys,setKeys]=useState([]), [ignore,setIgnore]=useState(DEFAULT_IGNORE), [compareBusy,setCompareBusy]=useState(false), [compareError,setCompareError]=useState('');
   const [filters,setFilters]=useState({}), [filterColumn,setFilterColumn]=useState(null), [search,setSearch]=useState(''), [error,setError]=useState(''), [pending,setPending]=useState(false), [loading,setLoading]=useState(false), [uploading,setUploading]=useState(false);
-  const [chartSelection,setChartSelection]=useState(null), [scheduleDraft,setScheduleDraft]=useState({enabled:false,times:['09:00'],newTime:'10:00'}), [savingSchedule,setSavingSchedule]=useState(false);
+  const [chartSelection,setChartSelection]=useState(null), [scheduleDraft,setScheduleDraft]=useState({enabled:false,times:['09:00'],days:ALL_DAYS,repeatMode:'all',newTime:'10:00'}), [savingSchedule,setSavingSchedule]=useState(false), [clearingHistory,setClearingHistory]=useState(false);
   const [selectedRemainingProducts, setSelectedRemainingProducts] = useState([]);
-  const [liveSheets,setLiveSheets]=useState(null), [liveSheetError,setLiveSheetError]=useState('');
-  const upload=useRef(), seen=useRef(null), scheduleLoaded=useRef(false), remainingLoaded=useRef(false), refreshRequest=useRef(null);
+  const [savingProducts,setSavingProducts]=useState(false);
+  const [loadedSheets,setLiveSheets]=useState(null), [liveSheetError,setLiveSheetError]=useState('');
+  const [refreshingProduction,setRefreshingProduction]=useState(false);
+  const [connectionError,setConnectionError]=useState(''), [cancelling,setCancelling]=useState(false);
+  const liveSheets=loadedSheets?.mode===reportMode&&(loadedSheets.data_revision||'')===(state.report_workspace?.data_revision||'')?loadedSheets:null;
+  const dataSourceKey=`${reportMode}:${state.report_workspace?.data_revision||''}`;
+  const sourceKey=`${dataSourceKey}:${reportRevision}`;
+  const sourceEditVersion=useRef(0);
+  const [deleteMessage,setDeleteMessage]=useState('');
+  const [deletingPreviews,setDeletingPreviews]=useState(false);
+  const previewHistoryVersion=useRef(0);
+  const seen=useRef(null), scheduleLoaded=useRef(false), remainingLoaded=useRef(false), refreshRequest=useRef(null), jobRunning=useRef(false);
   const [compareAttempt,setCompareAttempt]=useState(0);
+  const [sheetGroup,setSheetGroup]=useState('all'), [scheduleMessage,setScheduleMessage]=useState('');
+  const [sidebarCollapsed,setSidebarCollapsed,sidebarReady,sidebarError]=useSidebarState();
+  const mainScroll=useRef(null), viewScroll=useRef({});
+  const navigate=next=>{if(next==='settings'){window.dispatchEvent(new Event('datatrace:settings'));return;} viewScroll.current[view]=mainScroll.current?.scrollTop||0;setView(next);};
+  useEffect(()=>{if(mainScroll.current)mainScroll.current.scrollTop=viewScroll.current[view]||0;},[view]);
+  const deferredSearch=useDeferredValue(search);
+  const productionView=['sheets','overview'].includes(view);
+  const searchIndex=useMemo(()=>new WeakMap(),[]);
 
   function addTriggerTime() {
     const t = scheduleDraft.newTime?.trim();
@@ -432,48 +142,85 @@ function App() {
     setScheduleDraft(prev => ({ ...prev, times: updated }));
   }
 
-  const handleProductSelectionChange = (newSelection) => {
-    setSelectedRemainingProducts(newSelection);
-    api('/api/remaining-products', {
+  function setRepeatDays(preset) {
+    const days=preset==='weekdays'?WEEKDAYS:preset==='weekends'?WEEKENDS:ALL_DAYS;
+    setScheduleDraft(prev=>({...prev,repeatMode:preset,days:preset==='custom'?prev.days:days.slice()}));
+  }
+
+  function toggleRepeatDay(day) {
+    setScheduleDraft(prev=>({ ...prev, repeatMode:'custom', days:prev.days.includes(day)?prev.days.filter(value=>value!==day):[...prev.days,day].sort((a,b)=>a-b) }));
+  }
+
+  const handleProductSelectionChange = async (newSelection) => {
+    if(savingProducts)return;
+    setSavingProducts(true);
+    try {await api('/api/remaining-products', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ remaining_products: newSelection })
-    }).catch(console.error);
+    });setSelectedRemainingProducts(newSelection);}
+    catch(e){setError(`Product selection was not saved. ${e.message}`);}
+    finally{setSavingProducts(false);}
   };
   async function refresh() {
     if(refreshRequest.current)return refreshRequest.current;
     refreshRequest.current=(async()=>{
-    const next=await api('/api/state');
-    setState(next);
+    const editVersion=sourceEditVersion.current;
+    const captureVersion=previewHistoryVersion.current;
+    const next=await api('/api/state?light=1');
+    if(editVersion!==sourceEditVersion.current||captureVersion!==previewHistoryVersion.current)return;
+    setState(next);setConnectionError('');setReportMode(next.report_workspace?.mode||'tracker');jobRunning.current=next.job.running;
     if(next.schedule&&!scheduleLoaded.current){
       const times = next.schedule.times && next.schedule.times.length ? next.schedule.times : [next.schedule.time || '09:00'];
-      setScheduleDraft(prev => ({ ...prev, enabled: !!next.schedule.enabled, times: times }));
+      const days=next.schedule.days||ALL_DAYS;
+      setScheduleDraft(prev => ({ ...prev, enabled: !!next.schedule.enabled, times, days, repeatMode:dayPreset(days) }));
       scheduleLoaded.current=true;
     }
     if(Array.isArray(next.remaining_products)&&!remainingLoaded.current){setSelectedRemainingProducts(next.remaining_products);remainingLoaded.current=true;}
-    if(next.previews.length && next.previews[0].id!==seen.current){seen.current=next.previews[0].id;setSelected(next.previews[0].id);setPrevious(String(next.previews[1]?.id || ''));}
+    if(next.previews.length && next.previews[0].id!==seen.current){const priorLatest=seen.current;seen.current=next.previews[0].id;setSelected(current=>current===null||current===priorLatest?next.previews[0].id:current);setPrevious(current=>current||String(next.previews[1]?.id||''));}
     })();
     try{return await refreshRequest.current;}finally{refreshRequest.current=null;}
   }
-  useEffect(()=>{let active=true,timer;const poll=async()=>{try{if(active)await refresh();}catch(e){if(active)setError(e.message);}finally{if(active)timer=setTimeout(poll,1800);}};poll();return()=>{active=false;clearTimeout(timer);};},[]);
-  useEffect(()=>{if(!selected)return;let cancelled=false;setLoading(true);setPreview(EMPTY);setFilters({});setFilterColumn(null);setSearch('');setKeys([]);api(`/api/previews/${selected}`).then(data=>{if(!cancelled)setPreview(data);}).catch(e=>{if(!cancelled)setError(e.message);}).finally(()=>{if(!cancelled)setLoading(false);});return()=>{cancelled=true;};},[selected]);
+  useEffect(()=>{let active=true,timer;const poll=async()=>{try{if(active)await refresh();}catch(e){if(active)setConnectionError(e.message);}finally{if(active)timer=setTimeout(poll,document.hidden?30000:jobRunning.current?1800:10000);}};poll();return()=>{active=false;clearTimeout(timer);};},[]);
+  useEffect(()=>{if(!selected)return;let cancelled=false;setLoading(true);setPreview(EMPTY);setKeys([]);api(`/api/previews/${selected}`).then(data=>{if(!cancelled)setPreview(data);}).catch(e=>{if(!cancelled)setError(e.message);}).finally(()=>{if(!cancelled)setLoading(false);});return()=>{cancelled=true;};},[selected]);
+  useEffect(()=>{invalidateProduction();setLiveSheets(null);setFilters({});setSearch('');setChartSelection(null);},[dataSourceKey]);
   useEffect(()=>{
-    if(!(view==='sheets'))return;
+    if(!['sheets','overview'].includes(view))return;
     let active=true, busy=false;
     const refresh=async()=>{
       if(busy)return;
       busy=true;
-      try{const data=await api('/api/live-sheets');if(active){setLiveSheets(data);setLiveSheetError('');}}
-      catch(e){if(active){setLiveSheets(null);setLiveSheetError(e.message);}}
+      try{const data=await readProduction();if(active){setLiveSheets(data);setLiveSheetError('');}}
+      catch(e){if(active&&e.name!=='AbortError'){setLiveSheets(previous=>previous?{...previous,offline:true}:null);setLiveSheetError(e.message);}}
       finally{busy=false;}
     };
-    refresh();const timer=setInterval(refresh,30000);
-    return()=>{active=false;clearInterval(timer);};
-  },[view,preview.name,state.job.running]);
-  useEffect(()=>{setFilters({});setFilterColumn(null);setSearch('');setChartSelection(null);},[view,previous,selected]);
+    refresh();const timer=setInterval(()=>{if(!document.hidden)refresh();},30000);
+    const visible=()=>{if(!document.hidden)refresh();};
+    document.addEventListener('visibilitychange',visible);
+    return()=>{active=false;clearInterval(timer);document.removeEventListener('visibilitychange',visible);};
+  },[view,state.job.running,dataSourceKey]);
+  async function refreshProduction(){
+    if(refreshingProduction)return;
+    setRefreshingProduction(true);
+    const editVersion=sourceEditVersion.current;
+    try{
+      await api('/api/report-refresh',{method:'POST',timeoutMs:180000});
+      await refresh();
+      if(editVersion!==sourceEditVersion.current)return;
+      let data;
+      try{data=await readProduction(true);}
+      catch(e){if(e.name!=='AbortError'||editVersion!==sourceEditVersion.current)throw e;data=await readProduction(true);}
+      if(editVersion!==sourceEditVersion.current)return;
+      setLiveSheets(data);setLiveSheetError('');setReportRevision(value=>value+1);
+    }
+    catch(e){if(e.name!=='AbortError'){setLiveSheetError(e.message);setLiveSheets(previous=>previous?{...previous,offline:true}:null);}}
+    finally{setRefreshingProduction(false);}
+  }
+  useEffect(()=>{setFilters({});setFilterColumn(null);setSearch('');setChartSelection(null);},[view]);
+  useEffect(()=>{if(!['sheets','overview'].includes(view)){setFilters({});setFilterColumn(null);setSearch('');setChartSelection(null);}},[previous,selected]);
   useEffect(()=>{
     setDiff(null);setCompareBusy(false);setCompareError('');
-    if(!previous||!selected||Number(previous)===selected)return;
+    if(view!=='changes'||!previous||!selected||Number(previous)===selected)return;
     let cancelled=false;
     setCompareBusy(true);
     async function comparePreviews(){
@@ -492,17 +239,39 @@ function App() {
     comparePreviews();
     return()=>{cancelled=true;};
   },[previous,selected,keys,ignore,compareAttempt,view]);
+  const [syncAudit,setSyncAudit]=useState(null), [auditError,setAuditError]=useState('');
+  useEffect(()=>{if(view!=='audit')return;let active=true;api('/api/sync-reports').then(data=>{if(active){setSyncAudit(data.report);setAuditError('');}}).catch(e=>{if(active)setAuditError(e.message);});return()=>{active=false;};},[view,state.job.running]);
+  const auditTable=useMemo(()=>{
+    const rows=[...(syncAudit?.changes||[]),...(syncAudit?.not_in_latest||[]).map(number=>({'Order Number':number,Action:'Not in latest preview'})),...(syncAudit?.ambiguous||[]).map(row=>({...row,Action:'Needs review'})),...(syncAudit?.default_conflicts||[]).map(row=>({'Order Number':row['Order Number'],Action:'Baseline conflict',Reason:row.Reason}))];
+    return {columns:['Order Number','Action','Old Status','New Status','Reason'],rows};
+  },[syncAudit]);
   const comparisonTable = diff?.record_columns ? {columns:diff.record_columns,rows:[...diff.matched_rows,...diff.unmatched_rows]} : EMPTY;
-  const liveCurrent=!!liveSheets&&(view==='sheets');
-  const table = view==='changes' ? comparisonTable : liveCurrent ? liveSheets.sheets['All Products'] : EMPTY;
-  const liveFull=liveCurrent?liveSheets.sheets['Full Title']:null;
-  const liveRemaining=liveCurrent?liveSheets.sheets['Remaining Products']:null;
-  const filtered = useMemo(()=>table.rows.filter(row=>matches(row,filters)&&(!search||table.columns.some(c=>str(row[c]).toLowerCase().includes(search.toLowerCase())))),[table,filters,search]);
+  const liveCurrent=!!liveSheets&&productionView;
+  const allProduction=liveSheets?.sheets?.Overview||liveSheets?.sheets?.['All Products']||EMPTY;
+  const sheetTables=useMemo(()=>({all:allProduction,
+    full:liveSheets?.sheets?.['Full Title']||{columns:allProduction.columns,rows:allProduction.rows.filter(row=>['full title','full search'].includes(normalized(row.Product)))},
+    remaining:liveSheets?.sheets?.['Remaining Products']||{columns:allProduction.columns,rows:allProduction.rows.filter(row=>!['full title','full search'].includes(normalized(row.Product)))}
+  }),[liveSheets,allProduction,selectedRemainingProducts]);
+  const table = view==='captureDetail' ? preview : view==='changes' ? comparisonTable : view==='audit' ? auditTable : view==='sheets'?sheetTables[sheetGroup]:allProduction;
+  const liveFull=liveSheets?.sheets?.['Full Title'];
+  const liveRemaining=liveSheets?.sheets?.['Remaining Products'];
+  const filtered = useMemo(()=>{const query=deferredSearch.toLowerCase();return table.rows.filter(row=>{if(!matches(row,filters))return false;if(!query)return true;let indexed=searchIndex.get(row);if(!indexed){indexed=table.columns.map(c=>str(row[c]).toLowerCase()).join('\u0000');searchIndex.set(row,indexed);}return indexed.includes(query);});},[table,filters,deferredSearch,searchIndex]);
   const matchedComparison = view==='changes' ? filtered.filter(row=>['Unchanged','Matched - changed'].includes(row['Comparison Status'])) : [];
   const missingComparison = view==='changes' ? filtered.filter(row=>row['Comparison Status']==='Missing') : [];
-  const chartRows = useMemo(()=>chartSelection?filtered.filter(row=>label(row[chartSelection.column])===chartSelection.value):[],[chartSelection,filtered]);
+  const comparisonGroups = [
+    {key:'matched',title:'Matched',color:'green',rows:matchedComparison},
+    {key:'missing',title:'Missing Previews',color:'red',rows:missingComparison},
+    {key:'newly_added',title:'Newly added',color:'amber',rows:filtered.filter(row=>row['Comparison Status']==='Newly Added')},
+    {key:'unchanged',title:'Unchanged',color:'gray',rows:filtered.filter(row=>row['Comparison Status']==='Unchanged')},
+  ];
+  function showComparisonGroup(key){
+    const section=document.getElementById(`changes-orders-group-${key}`);
+    section?.scrollIntoView({behavior:'smooth',block:'start'});
+    section?.focus({preventScroll:true});
+  }
+  const chartRows = useMemo(()=>chartSelection?(chartSelection.rows||filtered.filter(row=>label(row[chartSelection.column])===chartSelection.value)):[],[chartSelection,filtered]);
   const productSplit = useMemo(()=>{
-    if(['changes','daily','monthly'].includes(view) || !table.columns.includes('Product')) return null;
+    if(['captures','changes','audit','daily','monthly'].includes(view) || !table.columns.includes('Product')) return null;
     let remainingRows = filtered.filter(row=>!['full title', 'full search'].includes(normalized(row.Product)));
     if (selectedRemainingProducts.length > 0) {
       const spSet = new Set(selectedRemainingProducts.map(p => p.toLowerCase()));
@@ -516,6 +285,9 @@ function App() {
 
   const overviewMetrics = useMemo(() => {
     if (view === 'changes') return [];
+    if (view === 'captureDetail') return loading || (selected && preview.id !== selected) ? [['Saved rows', '—', 'green'], ['Columns', '—', 'gray'], ['Source', loading ? 'Loading…' : 'Unavailable', 'gray']] : [['Saved rows', preview.rows.length.toLocaleString(), 'green'], ['Columns', preview.columns.length, 'gray'], ['Source', preview.source || 'Local file', 'gray']];
+    if(view==='audit')return [['Sync log entries',filtered.length.toLocaleString(),'gray']];
+    if(!liveSheets)return ['Visible orders','Online queue','Ground queue','Active clients','Full Title share'].map(title=>[title,'—','gray']);
     const ogC = table.columns.includes('Online/ Ground') ? 'Online/ Ground' : table.columns.includes('Online/Ground') ? 'Online/Ground' : null;
     const clC = table.columns.includes('Client') ? 'Client' : null;
     const prC = table.columns.includes('Product') ? 'Product' : null;
@@ -533,38 +305,63 @@ function App() {
       ['Active clients', clN.toLocaleString(), 'gray'],
       ['Full Title share', `${ftN.toLocaleString()} (${((ftN/tot)*100).toFixed(1)}%)`, 'gray']
     ];
-  }, [view, filtered, table.columns]);
+  }, [view, filtered, table.columns, liveSheets, preview, loading, selected]);
 
-  async function extract(){setPending(true);setError('');try{await api('/api/extract',{method:'POST'});await refresh();}catch(e){setError(e.message);}finally{setPending(false);}}
+  const [extractionRequest,setExtractionRequest]=useState({pending:false,error:''});
+  async function extract(){setPending(true);setExtractionRequest({pending:true,error:''});setError('');try{await api('/api/extract',{method:'POST'});await refresh();setExtractionRequest({pending:false,error:''});}catch(e){setError(e.message);setExtractionRequest({pending:false,error:e.message});}finally{setPending(false);}}
+  async function cancelExtraction(){
+    setCancelling(true);setError('');
+    try{await api('/api/extract/cancel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({run_id:state.job.run_id})});setState(current=>({...current,job:{...current.job,cancel_requested:true,stage:'Cancelling extraction…'}}));await refresh();}
+    catch(e){setError(e.message);}
+    finally{setCancelling(false);}
+  }
   const [exporting,setExporting]=useState(false);
   async function exportSheets(){
     setExporting(true);setError('');
     try{
-      let response=await fetch('/api/export/google-sheets');
-      if(response.status===409){
-        const detail=await response.json();
-        if(detail.requires_short_names){
-          if(!window.confirm('Excel allows only 31 characters per tab name. Export the trackers as “Full Title” and “Remaining Products”? Google Sheet names stay as configured.'))return;
-          response=await fetch('/api/export/google-sheets?short_names=true');
-        }else throw Error(detail.error||'Export failed');
-      }
+      const response=await fetch('/api/export/report');
       if(!response.ok)throw Error((await response.json()).error||'Export failed');
-      const filename=response.headers.get('Content-Disposition')?.match(/filename="?([^";]+)/)?.[1]||'GoogleSheets.xlsx';
+      const filename=response.headers.get('Content-Disposition')?.match(/filename="?([^";]+)/)?.[1]||'Production_data.xlsx';
       saveBlob(await response.blob(),filename);
     }catch(e){setError(e.message);}finally{setExporting(false);}
   }
-  async function syncSheets(){setPending(true);setError('');try{await api('/api/sync',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({preview:selected,previous:previous?Number(previous):null,keys,ignore,remaining_products:selectedRemainingProducts.length>0?selectedRemainingProducts:null})});await refresh();}catch(e){setError(e.message);}finally{setPending(false);}}
-  async function retryFailed(id){
-    setPending(true);setError('');
-    try{await api('/api/sync',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({preview:id})});await refresh();}
-    catch(e){setError(e.message);}finally{setPending(false);}
+  async function reportsChanged(next){
+    sourceEditVersion.current++;
+    invalidateProduction();setLiveSheets(null);setLiveSheetError('');
+    setState(current=>({...current,report_workspace:next}));
+    setReportMode(next.mode);setReportRevision(value=>value+1);setFilters({});setSearch('');setChartSelection(null);
+    if(next.mode==='excel')setSelectedRemainingProducts([]);else remainingLoaded.current=false;
+    await refresh();
   }
-  async function saveSchedule(enabled=true, times=scheduleDraft.times){
+  const [sheetSync,setSheetSync]=useState(false);
+  useEffect(()=>{api('/api/sheet-sync').then(value=>setSheetSync(value.enabled)).catch(()=>{});},[]);
+  async function toggleSheetSync(){try{const value=await api('/api/sheet-sync',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:!sheetSync})});setSheetSync(value.enabled);}catch(e){setError(e.message);}}
+  async function syncSheets(){setPending(true);setError('');try{
+    if(reportMode==='excel'||!selected){const result=await api('/api/report-publish',{method:'POST',timeoutMs:180000});if(!result.synced&&!result.queued)throw Error(result.sync_error);}
+    else {
+      const reportView=['overview','sheets','daily','monthly','capacity','sla'].includes(view);
+      const target=reportView?state.previews[0]?.id:selected;
+      await api('/api/sync',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({preview:target,...(!reportView?{previous:previous?Number(previous):null}:{}),keys,ignore})});
+    }
+    await refresh();
+  }catch(e){setError(e.message);}finally{setPending(false);}}
+  async function retryFailed(id){setPending(true);setError('');try{await api('/api/sync',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({preview:id})});await refresh();}catch(e){setError(e.message);}finally{setPending(false);}}
+  async function resolvePreviewConflict(id){setPending(true);setError('');try{
+    const result=await api('/api/previews/reconcile',{method:'POST'});
+    const renumbered=Object.values(result.mapping||{}).map(Number).sort((a,b)=>a-b);
+    const next=renumbered.at(-1)||id;
+    if(renumbered.length){setSelected(next);setPrevious(String(renumbered.at(-2)||''));setDeleteMessage(`Pending captures renumbered to follow Google Sheets history. Recovery copy: ${result.recovery_backup}. Syncing through preview${next} now.`);}
+    await api('/api/sync',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({preview:next})});
+    await refresh();
+  }catch(e){setError(e.message);}finally{setPending(false);}}
+  async function saveSchedule(enabled=true, times=scheduleDraft.times, days=scheduleDraft.days){
     setSavingSchedule(true);
+    setScheduleMessage('');
     setError('');
     try{
-      const saved=await api('/api/sync-schedule',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled,times})});
-      setScheduleDraft(prev=>({...prev,enabled:saved.enabled,times:saved.times||[saved.time]}));
+      const saved=await api('/api/sync-schedule',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled,times,days})});
+      setScheduleDraft(prev=>({...prev,enabled:saved.enabled,times:saved.times||[saved.time],days:saved.days||ALL_DAYS}));
+      setScheduleMessage(saved.enabled?'Schedule saved. Times are in IST on the selected days.':'Schedule paused.');
       await refresh();
     }catch(e){
       setError(e.message);
@@ -572,18 +369,65 @@ function App() {
       setSavingSchedule(false);
     }
   }
-  async function importFile(e){const file=e.target.files[0];if(!file)return;setUploading(true);setError('');try{const body=new FormData();body.append('file',file);await api('/api/import',{method:'POST',body});await refresh();}catch(e){setError(e.message);}finally{setUploading(false);e.target.value='';}}
+
+  async function clearScheduleHistory(kind){
+    setClearingHistory(true);
+    setError('');
+    try{
+      await api('/api/sync-schedule/clear-history',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({kind})});
+      await refresh();
+    }catch(e){setError(e.message);}finally{setClearingHistory(false);}
+  }
+
   function choosePrevious(value){setPrevious(value);if(!value)return;const index=state.previews.findIndex(p=>p.id===Number(value));const newer=state.previews[index-1];if(newer)setSelected(newer.id);}
   function chooseLatest(value){const id=Number(value);setSelected(id);const index=state.previews.findIndex(p=>p.id===id);setPrevious(String(state.previews[index+1]?.id||''));}
-  async function deletePreview(event,id){event.stopPropagation();const target=state.previews.find(p=>p.id===id);if(!window.confirm(`Delete ${target?.name||`preview${id}`} and its saved CSV/Excel files?`))return;setError('');try{await api(`/api/previews/${id}`,{method:'DELETE'});const next=await api('/api/state');setState(next);seen.current=next.previews[0]?.id??null;const nextSelected=id===selected?(next.previews[0]?.id??null):selected;setSelected(nextSelected);const index=next.previews.findIndex(p=>p.id===nextSelected);setPrevious(String(next.previews[index+1]?.id||''));if(!nextSelected){setPreview(EMPTY);setDiff(null);}}catch(e){setError(e.message);}}
+  async function applyCaptureHistory(result){
+    previewHistoryVersion.current++;
+    const history=Array.isArray(result.previews)?result:await api('/api/state?light=1');
+    const clearSelection=!history.previews.length;
+    invalidateProduction();
+    seen.current=history.previews[0]?.id??null;
+    setState(current=>({...current,previews:history.previews,pending_sync:history.pending_sync,
+      job:clearSelection?{...current.job,result:null,stage:'Idle'}:current.job}));
+    const nextSelected=!clearSelection&&history.previews.some(preview=>preview.id===selected)?selected:seen.current;
+    const index=history.previews.findIndex(preview=>preview.id===nextSelected);
+    setSelected(nextSelected);
+    setPrevious(String(history.previews[index+1]?.id||''));
+    if(clearSelection||!nextSelected){
+      setPreview(EMPTY);
+      setLoading(false);
+      setDiff(null);
+    }
+    refreshProduction();
+  }
+
+  async function removePreviews(ids, single=false){
+    if(deletingPreviews||!ids.length)return;
+    const prompt=`Delete ${single?`preview${ids[0]}`:`${ids.length} selected captures`} and their saved files? A recovery copy will be saved first.`;
+    if(!window.confirm(prompt))return;
+    setDeletingPreviews(true);
+    setError('');
+    setDeleteMessage('');
+    try{
+      const result=await api(single?`/api/previews/${ids[0]}`:'/api/previews/batch-delete',single?{method:'DELETE'}:
+        {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ids})});
+      await applyCaptureHistory(result);
+      const count=single?1:result.deleted.length;
+      setDeleteMessage(`${count} ${count===1?'capture':'captures'} deleted.${count&&!result.previews.length?' The next capture will be preview1.':''}${result.recovery_backup?` Recovery copy: ${result.recovery_backup}.`:''}`);
+    }catch(e){setError(e.message);}
+    finally{setDeletingPreviews(false);}
+  }
+  function deletePreview(event,id){event.stopPropagation();return removePreviews([id],true);}
+  function batchDeletePreviews(ids){return removePreviews(ids);}
   async function downloadChanges(){try{const response=await fetch('/api/compare',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({previous:Number(previous),latest:selected,keys,ignore,download:true})});if(!response.ok)throw Error((await response.json()).error);saveBlob(await response.blob(),`${diff.previous}-to-${diff.latest}-changes.xlsx`);}catch(e){setError(e.message);}}
-  const running=state.job.running||pending, result=state.job.result;
-  return <div className="workspace">
-    <aside className="sidebar"><div className="brand"><div className="brand-mark"><Activity size={23}/></div><div>DataTrace<span>WORKSPACE</span></div></div><div className="nav-label">WORKSPACE</div><nav>{[['sheets','Data sheets',Table2],['daily','Daily Orders',FileSpreadsheet],['monthly','Monthly report',CalendarDays],['changes','Changes',ArrowLeftRight]].map(([id,title,Icon])=><button className={view===id?'nav-item selected':'nav-item'} key={id} onClick={()=>setView(id)}><Icon size={18}/>{title}{id==='changes'&&diff&&<small>{diff.record_counts?diff.record_counts.missing+diff.record_counts.newly_added:diff.counts.added+diff.counts.removed}</small>}</button>)}</nav><div className="preview-heading"><span className="nav-label">SAVED PREVIEWS</span><span>{state.previews.length}</span></div><div className="preview-list">{state.previews.map(p=><div key={p.id} className={`preview-item ${selected===p.id?'selected':''}`}><button className="preview-select" onClick={()=>{setSelected(p.id);const index=state.previews.findIndex(x=>x.id===p.id);setPrevious(String(state.previews[index+1]?.id||''));}}><FileSpreadsheet size={17}/><div><strong>{p.name}</strong><small>{p.row_count.toLocaleString()} rows · {new Date(p.created).toLocaleDateString()}</small></div>{p.id===state.previews[0].id&&<i>Latest</i>}</button><IconButton title={`Delete ${p.name}`} onClick={event=>deletePreview(event,p.id)}><Trash2 size={15}/></IconButton></div>)}{!state.previews.length&&<p className="no-previews">No saved previews</p>}</div><div className="sidebar-footer"><span className="status-dot"/>Local workspace<a href={state.sheet_url} target="_blank" rel="noreferrer">Google Sheet ↗</a></div></aside>
-    <main><header className="topbar"><div className="breadcrumb">Workspace <span>/</span> {view==='sheets'?'Data sheets':view==='daily'?'Daily Orders':view==='monthly'?'Monthly report':'Changes'}</div><div className="inline"><span className={`run-state ${running?'running':''}`}>{running&&<LoaderCircle size={14} className="spin"/>}{pending&&!state.job.running?'Starting…':state.job.stage}</span><button className="secondary" onClick={()=>upload.current.click()} disabled={uploading}><Upload size={16}/>{uploading?'Importing…':'Import file'}</button><button className="secondary" onClick={exportSheets} disabled={exporting||running} title="Download all Google Sheet tabs as Excel">{exporting?<LoaderCircle size={16} className="spin"/>:<ArrowDownToLine size={16}/>} {exporting?'Exporting...':'Export'}</button><input ref={upload} type="file" hidden accept=".csv,.xlsx" onChange={importFile}/></div></header>
-      <div className="content"><div className="page-heading"><div><span className="eyebrow">DATATRACE QUEUE</span><h1>{view==='changes'?'Preview comparison':view==='sheets'?'Data sheets':view==='daily'?'Daily Orders':view==='monthly'?'Monthly report':'Data sheets'}</h1><p className="muted">{preview.name?`${preview.name} · ${new Date(preview.created).toLocaleString()} · ${preview.source}`:'No data captured yet'}</p></div><div className="page-actions"><button className="secondary" onClick={syncSheets} disabled={running||!selected||loading||compareBusy||!!compareError}>{state.job.action==='sync'&&running?<LoaderCircle size={17} className="spin"/>:<CloudUpload size={17}/>}<span>{state.job.action==='sync'&&running?'Syncing…':`Retry ${preview.name||'preview'} sync`}</span></button><details className="sync-schedule"><summary><Clock3 size={16}/>AutoLogin Trigger</summary><div>
-        <TriggerClock schedule={state.schedule} clock={state.clock}/>
-        <button className="secondary" disabled={savingSchedule||!state.schedule} onClick={()=>saveSchedule(!state.schedule?.enabled,state.schedule?.times||[state.schedule?.time||'09:00'])}>{state.schedule?.enabled?'Pause schedule':'Resume schedule'}</button>
+  const running=state.job.running||pending||uploading||deletingPreviews, result=state.job.result;
+  return <div className={`workspace ${sidebarCollapsed?'sidebar-collapsed':''}`} data-view={view}>
+    <a className="skip-link" href="#workspace-content">Skip to workspace</a>
+    <WorkspaceSidebar state={state} selected={selected} view={view} onNavigate={navigate} collapsed={sidebarCollapsed} onToggle={()=>{if(sidebarReady)setSidebarCollapsed(!sidebarCollapsed).catch(()=>{});}} snapshot={liveSheets} busy={running} onRefresh={refreshProduction} refreshing={refreshingProduction} onDelete={deletePreview} onBatchDelete={batchDeletePreviews} onSelect={id=>{setSelected(id);navigate('captures');const index=state.previews.findIndex(p=>p.id===id);setPrevious(String(state.previews[index+1]?.id||''));}}/>
+    <main ref={mainScroll}><header className="topbar"><div className="breadcrumb"><span>Workspace</span><ChevronRight size={13}/><strong>{VIEW_TITLES[view]}</strong></div><div className="topbar-report-source"><ReportControls mode={reportMode} running={running} open={reportImportOpen} setOpen={setReportImportOpen} onChanged={reportsChanged} onBusy={setUploading} workspaceState={state.report_workspace}/></div><div className="inline topbar-actions"><DesktopTools onNavigate={navigate} onImport={()=>setReportImportOpen(true)} running={running}/><span className={`run-state ${running?'running':''}`}>{running&&<LoaderCircle size={14} className="spin"/>}{pending&&!state.job.running?'Starting…':state.job.stage}</span><button className="secondary" onClick={()=>setReportImportOpen(true)} disabled={uploading}><Upload size={16}/>{uploading?'Importing…':'Import files'}</button><button className="secondary" onClick={exportSheets} disabled={exporting||running} title="Download the selected report source as Excel">{exporting?<LoaderCircle size={16} className="spin"/>:<ArrowDownToLine size={16}/>} {exporting?'Exporting...':'Export'}</button><button className="secondary" role="switch" aria-checked={sheetSync} onClick={toggleSheetSync}>Sheet_sync {sheetSync?'On':'Off'}</button><NavbarPreferences/></div></header>
+      <div className="content" id="workspace-content" tabIndex={-1}><div className="page-heading"><div><h1>{VIEW_TITLES[view]}</h1><p className="muted">{({daily:'Daily production, completion, and order details.',monthly:'Monthly trends and production performance.',sla:'Monitor deadlines and orders that need attention.',slaCompare:'Compare queue statuses with your production reports.',capacity:'Plan capacity and track daily workload.',changes:'Review what changed between saved captures.',captures:'Your saved snapshots, organized and ready to explore.',captureDetail:preview.name?`${preview.name} · ${new Date(preview.created).toLocaleString()}`:'Explore your saved capture.',importChanges:'Review edits from imported workbooks.',audit:'Your capture and synchronization history.',sheets:'All your production orders in one place.',overview:'Your production, clearly organized.'})[view]}</p></div><div className="page-actions"><button className="secondary" onClick={syncSheets} disabled={!sheetSync||running||loading||compareBusy||!!compareError}>{state.job.action==='sync'&&running?<LoaderCircle size={17} className="spin"/>:<CloudUpload size={17}/>}<span>{state.job.action==='sync'&&running?'Syncing…':'Sync to Sheets'}</span></button><details className="sync-schedule"><summary><Clock3 size={16}/><span>AutoLogin Trigger</span><span className={`schedule-state ${state.schedule?.enabled?'enabled':''}`}>{state.schedule?.enabled?'On':'Paused'}</span></summary><div>
+        <TriggerClock schedule={state.schedule} clock={state.clock} onClearHistory={clearScheduleHistory} clearingHistory={clearingHistory}/>
+        <button className="secondary" disabled={savingSchedule||!state.schedule} onClick={()=>saveSchedule(!state.schedule?.enabled,state.schedule?.times||[state.schedule?.time||'09:00'],state.schedule?.days||ALL_DAYS)}>{state.schedule?.enabled?'Pause schedule':'Resume schedule'}</button>
         <div className="schedule-times-label">Scheduled times (IST):</div>
         <div className="schedule-times-list">
           {(scheduleDraft.times || []).map(t => (
@@ -599,37 +443,52 @@ function App() {
           <label>Indian Standard Time (UTC+05:30)<input aria-label="New trigger time" type="time" value={scheduleDraft.newTime || '10:00'} onChange={e => setScheduleDraft({ ...scheduleDraft, newTime: e.target.value })}/></label>
           <button type="button" className="add-time-btn" title="Add trigger time" onClick={addTriggerTime}><Plus size={15}/>Add</button>
         </div>
-        <button className="primary" onClick={()=>saveSchedule()} disabled={savingSchedule||!scheduleDraft.times.length}>{savingSchedule?'Saving…':'Save AutoLogin Trigger'}</button>
-        {state.schedule?.last_triggered_date&&<small>Last triggered {state.schedule.last_triggered_date}</small>}
-      </div></details><button className="primary" onClick={extract} disabled={running}>{state.job.action==='extract'&&running?<LoaderCircle size={17} className="spin"/>:<Play size={17}/>}<span>{state.job.action==='extract'&&running?'Extracting queue…':'Run AutoLogin & Extract Queue'}</span></button></div></div>
-
+        <div className="schedule-repeat"><label htmlFor="schedule-repeat-mode">Repeat on</label><select id="schedule-repeat-mode" value={scheduleDraft.repeatMode} onChange={e=>setRepeatDays(e.target.value)}><option value="all">Every day</option><option value="weekdays">Mon–Fri</option><option value="weekends">Sat–Sun</option><option value="custom">Custom days</option></select>{scheduleDraft.repeatMode==='custom'&&<div className="schedule-day-options" aria-label="Custom schedule days">{WEEK_DAYS.map((name,day)=><label key={name}><input type="checkbox" checked={scheduleDraft.days.includes(day)} onChange={()=>toggleRepeatDay(day)}/>{name}</label>)}</div>}<small>These days apply to every scheduled time.</small></div>
+        <button className="primary" onClick={()=>saveSchedule()} disabled={savingSchedule||!scheduleDraft.times.length||!scheduleDraft.days.length}>{savingSchedule?'Saving…':'Save AutoLogin Trigger'}</button>
+        {scheduleMessage&&<p className="schedule-feedback" role="status"><Check size={14}/>{scheduleMessage}</p>}{state.schedule?.last_triggered_date&&<small>Last triggered {state.schedule.last_triggered_date}</small>}
+      </div></details><button className="primary" onClick={extract} disabled={running}>{state.job.action==='extract'&&running?<LoaderCircle size={17} className="spin"/>:<Camera size={17}/>}<span>{state.job.action==='extract'&&running?'Extracting…':'Extract Queue'}</span></button>{state.job.running&&state.job.action==='extract'&&<button className="secondary" onClick={cancelExtraction} disabled={cancelling||state.job.cancel_requested}><X size={17}/>{cancelling||state.job.cancel_requested?'Cancelling…':'Cancel extraction'}</button>}</div></div>
+      <WorkspaceContext reportMode={view==='capacity'?'excel':reportMode} view={view} production={productionView} preview={preview} snapshot={liveSheets} running={running} stage={pending&&!state.job.running?'Starting…':state.job.stage} pending={view==='capacity'?0:state.pending_sync} selected={selected} sheetUrl={state.sheet_url} onRefresh={refreshProduction} refreshing={refreshingProduction}/>
+      {reportMode==='tracker'&&['overview','sheets'].includes(view)&&state.pending_sync>0&&<div className="notice warning" role="status"><strong>Tracker reports are waiting for {state.pending_sync} saved capture{state.pending_sync===1?'':'s'} to sync.</strong> Overview shows the last synced tracker data.<button className="secondary" disabled={running} onClick={syncSheets}>Sync latest captures</button></div>}
+      {sidebarError&&<div className="notice warning" role="alert">{sidebarError}</div>}
+      {deleteMessage&&<div className="notice" role="status">{deleteMessage}<IconButton title="Dismiss recovery message" onClick={()=>setDeleteMessage('')}><X size={16}/></IconButton></div>}
+      {(state.failed_syncs||[]).map(failure=><DismissibleNotice key={`failed-sync-${failure.preview_id}`} noticeId={`failed-sync-${failure.preview_id}`} className="notice warning" role="alert"><strong>{failure.preview_name} retained locally.</strong> {failure.error}{/preview name already (identifies|belongs to) a different saved snapshot/i.test(failure.error)?<button className="secondary" disabled={running||pending} onClick={()=>resolvePreviewConflict(failure.preview_id)}>Resolve numbering & retry</button>:<button className="secondary" disabled={running||pending} onClick={()=>retryFailed(failure.preview_id)}>Retry sync</button>}</DismissibleNotice>)}
+      {view==='audit'&&<div className="notice">Local sync activity · {syncAudit?.preview_name||'No sync report yet'}</div>}
+      {view==='audit'&&auditError&&<div className="notice error">{auditError}</div>}
       {error&&<div className="notice error" role="alert">{error}<IconButton title="Dismiss error" onClick={()=>setError('')}><X size={16}/></IconButton></div>}
-      {(state.failed_syncs||[]).map(failure=><div key={failure.preview_id} className="notice warning" role="alert"><strong>{failure.preview_name} retained locally.</strong> {failure.error}<button className="secondary" disabled={running} onClick={()=>retryFailed(failure.preview_id)}>Retry sync</button></div>)}
-      {liveSheetError&&(view==='sheets')&&<div className="notice warning" role="status">Google Sheet unavailable. Reports will refresh when the connection returns. {liveSheetError}</div>}
-      {liveCurrent&&<div className="notice" role="status">Connected Google Sheet · all retained orders</div>}
-      {result?.pass_report&&!running&&<div className="notice">Scanned {result.pass_report.scanned} · Added {result.pass_report.added} · Updated {result.pass_report.updated} · Unchanged {result.pass_report.unchanged} · Not in latest {result.pass_report.not_in_latest_count??result.pass_report.not_in_latest?.length??0} · Needs review {result.pass_report.ambiguous_count??result.pass_report.ambiguous?.length??0}</div>}
-      {result?.error&&<div className="notice warning" role="status">{result.preview_name&&<strong>{result.preview_name} saved. </strong>}{result.error}</div>}
-      {result&&!result.error&&!running&&<div className="notice success"><Check size={16}/>{result.action==='sync'?`${result.preview_name} synced · ${result.rows} rows · ${result.worksheets?.length||0} Google Sheets tabs updated`:`${result.preview_name} saved locally · ${result.rows} rows · Automatic Google Sheets sync pending`}</div>}
-      {!state.previews.length && !liveSheets ? <div className="empty-state"><div className="empty-icon"><Database size={40} strokeWidth={1.3}/></div><h2>No queue data yet</h2><p>Your saved previews will appear here.</p><button className="secondary" onClick={()=>upload.current.click()}><Plus size={17}/>Import Excel or CSV</button></div> : <>
-      {view==='changes'&&<section className="compare-controls"><label>Previous preview<select aria-label="Previous preview" value={previous} onChange={e=>choosePrevious(e.target.value)}><option value="">Select a preview</option>{state.previews.filter(p=>p.id!==selected).map(p=><option key={p.id} value={p.id}>{p.name}</option>)}</select></label><ArrowLeftRight size={18}/><label>Latest preview<select aria-label="Latest preview" value={selected||''} onChange={e=>chooseLatest(e.target.value)}>{state.previews.map(p=><option key={p.id} value={p.id}>{p.name}</option>)}</select></label><span className="muted">Matched by Order Number (ignoring case and spaces)</span><details className="match-options"><summary>Ignored columns ({ignore.length})</summary><div>{preview.columns.map(c=><label className="check-row" key={c}><input type="checkbox" checked={ignore.includes(c)} onChange={()=>setIgnore(ignore.includes(c)?ignore.filter(k=>k!==c):[...ignore,c])}/>{c}</label>)}</div></details><button className="secondary" disabled={!diff||compareBusy} onClick={downloadChanges}><ArrowDownToLine size={16}/>Power BI changes.xlsx</button></section>}
+      {connectionError&&<div className="notice warning" role="status">{connectionError}</div>}
+      {liveSheetError&&(!state.capabilities?.desktop||state.capabilities?.google_configured)&&<div className="notice warning" role="status">{reportMode==='excel'?'Imported Excel reports are saved locally.':'Could not refresh Google Sheets reports.'} {liveSheetError}</div>}
+      {reportMode==='excel'&&state.report_workspace?.cloud_refresh_error&&<DismissibleNotice noticeId={`import-cloud-${state.report_workspace.cloud_refresh_error}`} className="notice warning" role="alert">{state.report_workspace.cloud_refresh_error}</DismissibleNotice>}
+      {liveSheets?.cache_warning&&productionView&&<div className="notice warning" role="status">{liveSheets.cache_warning}</div>}
+      {productionView&&<OfflineNotice snapshot={liveSheets}/>}{liveCurrent&&!liveSheets.offline&&reportMode==='excel'&&state.report_workspace?.publication_state!=='synced'&&<div className="notice warning" role="status">Imported Excel report is saved locally. {state.report_workspace?.publication_state==='error'?'Google Sheets update failed; open Report details to retry.':'Google Sheets update is still pending.'}</div>}{liveCurrent&&!liveSheets.offline&&(reportMode!=='excel'||state.report_workspace?.publication_state==='synced')&&<DismissibleNotice key={`connected-${state.job.run_id}`} noticeId={`connected-${state.job.run_id}`} role="status"><Check size={14}/>{reportMode==='excel'?'Imported Excel report · Google Sheets updated':state.pending_sync?'Google Sheets connected · latest captures are awaiting sync':'Google Sheets connected · all retained tracker orders'}{liveSheets.updated_at&&<span> · Refreshed {new Date(liveSheets.updated_at).toLocaleTimeString()}</span>}</DismissibleNotice>}
+      {result?.error&&<DismissibleNotice key={`error-${state.job.run_id}`} noticeId={`error-${state.job.run_id}`} className="notice warning" role="status">{result.preview_name&&<strong>{result.preview_name} saved. </strong>}{result.error}</DismissibleNotice>}
+      {result?.cancelled&&!running&&<DismissibleNotice key={`cancelled-${state.job.run_id}`} noticeId={`cancelled-${state.job.run_id}`} role="status">Extraction cancelled. {result.saved_locally?`${result.preview_name} remains saved locally for sync.`:'Existing captures and imported reports are retained.'}</DismissibleNotice>}
+      {result&&!result.error&&!result.cancelled&&!running&&<DismissibleNotice key={`result-${state.job.run_id}`} noticeId={`result-${state.job.run_id}`} className="notice success"><Check size={16}/>{result.action==='sync'?`${result.preview_name} synced · ${result.rows} rows · ${result.worksheets?.length||0} Google Sheets tabs updated`:`${result.preview_name} saved locally · ${result.rows} rows · Google Sheets sync pending`}</DismissibleNotice>}
+      {result?.pass_report&&!running&&(reportMode==='tracker'||view==='audit')&&<DismissibleNotice key={`scan-${state.job.run_id}`} noticeId={`scan-${state.job.run_id}`} role="status">{result.pass_report.scanned} scanned · {result.pass_report.added} added · {result.pass_report.updated} updated · {result.pass_report.unchanged} unchanged · {reportCount(result.pass_report,'not_in_latest')} not in latest preview</DismissibleNotice>}
+      {result?.pass_report&&!running&&(reportMode==='tracker'||view==='audit')&&(reportCount(result.pass_report,'ambiguous')+reportCount(result.pass_report,'unprocessed')>0)&&<DismissibleNotice key={`review-${state.job.run_id}`} noticeId={`review-${state.job.run_id}`} className="notice warning" role="status">{reportCount(result.pass_report,'ambiguous')+reportCount(result.pass_report,'unprocessed')} review items · open Sync activity to review the saved local report.</DismissibleNotice>}
+      {view==='audit'&&<><OperationActivity running={running}/><MonthlyActivity/></>}
+      <React.Suspense fallback={<LoadingScreen title="Loading view…"/>}>{view==='productionReport'?<ProductionReport revision={sourceKey} session={productionReportSession}/>:view==='captures'?<CaptureLibrary previews={state.previews} busy={running} onOpen={id=>{chooseLatest(id);navigate('captureDetail');}} onDelete={deletePreview} onBatchDelete={batchDeletePreviews}/>:view==='importChanges'?<ImportExcelChanges revision={sourceKey} onRefresh={refreshProduction} refreshing={refreshingProduction}/>:view==='sla'?<SlaStatus mode={reportMode} revision={sourceKey} onUpdated={()=>{setReportRevision(value=>value+1);refresh().catch(error=>setConnectionError(error.message));}}/>:view==='slaCompare'?<SlaCompare state={state} reportMode={reportMode}/>:!state.previews.length && !liveSheets && !['monthly','audit','capacity'].includes(view) ? <LocalWelcome onImport={()=>setReportImportOpen(true)}/> : view==='overview'?<><ProductionOverview snapshot={liveSheets} state={state} onNavigate={navigate}/><OverviewDashboard key={dataSourceKey} rows={filtered} columns={table.columns} onSelect={setChartSelection} selectedProducts={selectedRemainingProducts} setSelectedProducts={handleProductSelectionChange} savingProducts={savingProducts}/><AdvancedChart rows={filtered} columns={table.columns} onSelect={setChartSelection}/><React.Suspense fallback={null}>{chartSelection&&<SideDrawer title={`${chartSelection.column}: ${chartSelection.value}`} rows={chartRows} columns={table.columns} onClose={()=>setChartSelection(null)}/>}</React.Suspense></>:view==='sheets'?<><SheetSegments imported={liveSheets?.mode==='excel'} value={sheetGroup} onChange={value=>{setSheetGroup(value);setFilterColumn(null);}} counts={Object.fromEntries(Object.entries(sheetTables).map(([key,value])=>[key,value.rows.length]))}/><div className={filterColumn?'data-layout with-filter':'data-layout'}><OrdersWorkspace key={dataSourceKey} snapshot={liveSheets} rows={filtered} columns={table.columns} search={search} setSearch={setSearch} filters={filters} setFilters={setFilters} openFilter={setFilterColumn} previews={state.previews}/>{filterColumn&&<FilterPanel key={filterColumn} column={filterColumn} rows={table.rows} filters={filters} setFilters={setFilters} close={()=>setFilterColumn(null)}/>}</div></>:<>
+      {view==='captureDetail'&&<CapturePicker previews={state.previews} selected={selected} onSelect={chooseLatest} onDelete={deletePreview} busy={running}/>}
+      {view==='captureDetail'&&preview.id&&<div className="notice" role="status">Raw saved capture · {preview.name}<a className="secondary" href={`/api/previews/${preview.id}/download/xlsx`}>Download Excel</a></div>}{view==='changes'&&<section className="compare-controls"><label>Previous preview<select aria-label="Previous preview" value={previous} onChange={e=>choosePrevious(e.target.value)}><option value="">Select a preview</option>{state.previews.filter(p=>p.id!==selected).map(p=><option key={p.id} value={p.id}>{p.name}</option>)}</select></label><ArrowLeftRight size={18}/><label>Latest preview<select aria-label="Latest preview" value={selected||''} onChange={e=>chooseLatest(e.target.value)}>{state.previews.map(p=><option key={p.id} value={p.id}>{p.name}</option>)}</select></label><span className="muted">Matched by Order Number (ignoring case and surrounding spaces)</span><details className="match-options"><summary>Ignored columns ({ignore.length})</summary><div>{preview.columns.map(c=><label className="check-row" key={c}><input type="checkbox" checked={ignore.includes(c)} onChange={()=>setIgnore(ignore.includes(c)?ignore.filter(k=>k!==c):[...ignore,c])}/>{c}</label>)}</div></details><button className="secondary" disabled={!diff||compareBusy} onClick={downloadChanges}><ArrowDownToLine size={16}/>Power BI changes.xlsx</button></section>}
       {view==='changes'&&compareError&&<div className="notice warning" role="alert">{compareError}<button className="secondary" onClick={()=>setCompareAttempt(value=>value+1)}>Retry comparison</button></div>}
       {view==='changes'&&!previous&&<div className="notice">Capture or import a second preview to compare changes.</div>}
       {view==='changes'&&diff&&<><p className="comparison-method">{diff.method}</p>{(diff.added_columns.length>0||diff.removed_columns.length>0)&&<div className="notice">Columns added: {diff.added_columns.join(', ')||'None'} · Columns removed: {diff.removed_columns.join(', ')||'None'}</div>}</>}
-      {!['daily','monthly'].includes(view)&&<div className="metrics">{(view==='changes'?[['Matched',diff?.record_counts?.matched??'—','green'],['Missing Previews',diff?.record_counts?.missing??'—','red'],['Newly added',diff?.record_counts?.newly_added??'—','amber'],['Unchanged',diff?.record_counts?.unchanged??'—','gray']]:overviewMetrics).map(([title,value,color])=><div className={`metric ${color}`} key={title}><span>{title}</span><strong>{value}</strong></div>)}</div>}
-      {!['daily','monthly'].includes(view)&&<div className="filter-toolbar"><div className="search-input"><Search size={16}/><input aria-label="Search rows" placeholder="Search all columns" value={search} onChange={e=>setSearch(e.target.value)}/></div><select aria-label="Choose column filter" value={filterColumn||''} onChange={e=>setFilterColumn(e.target.value||null)}><option value="">Filter a column…</option>{table.columns.map(c=><option key={c}>{c}</option>)}</select>{Object.keys(filters).map(c=><button className="filter-chip" key={c} onClick={()=>setFilterColumn(c)}><Filter size={12}/>{c}</button>)}{Object.keys(filters).length>0&&<button className="text-button" onClick={()=>setFilters({})}>Clear filters</button>}<span className="row-tally">{filtered.length.toLocaleString()} / {table.rows.length.toLocaleString()} rows</span>{view!=='changes'&&preview.id&&<><button className="secondary" onClick={exportSheets}><ArrowDownToLine size={16}/>Excel</button><a className="secondary" href={`/api/previews/${preview.id}/download/csv`}>CSV</a></>}</div>}
-      {(loading||(view==='changes'&&compareBusy))?<div className="loading"><LoaderCircle className="spin"/>Loading preview…</div>:<><div className={filterColumn?'data-layout with-filter':'data-layout'}><div className="data-main">{view==='sheets'&&<StatusReport rows={filtered}/>}
-        {view==='daily'&&<DailyOrders preview={preview} running={running}/>}
-        {view==='monthly'&&<MonthlyOrders preview={preview} running={running}/>}
-        {['daily','monthly'].includes(view) ? null : productSplit ? <>
-          <DataTable rows={filtered} columns={table.columns} filters={filters} openFilter={setFilterColumn} name={`${preview.name||'Queue'} - All Products`}/>
-          <DataTable rows={liveFull?liveFull.rows.filter(row=>!search||liveFull.columns.some(column=>str(row[column]).toLowerCase().includes(search.toLowerCase()))):productSplit.fullTitle} columns={liveFull?.columns||table.columns} filters={liveFull?{}:filters} openFilter={setFilterColumn} name={`${preview.name||'Queue'} - Full Title`}/>
-          <DataTable rows={liveRemaining?liveRemaining.rows.filter(row=>!search||liveRemaining.columns.some(column=>str(row[column]).toLowerCase().includes(search.toLowerCase()))):productSplit.remaining} columns={liveRemaining?.columns||table.columns} filters={liveRemaining?{}:filters} openFilter={setFilterColumn} name={`${preview.name||'Queue'} - Remaining Products`}/>
-        </> : <>{view==='changes'&&diff?.order_append&&<section className="order-append"><div className="order-append-summary"><div><span>Previous last order</span><strong>{diff.order_append.anchor_order||'Not available'}</strong></div><div><span>First new order</span><strong>{diff.order_append.first_added_order||'—'}</strong></div><div><span>Latest new order</span><strong>{diff.order_append.latest_added_order||'—'}</strong></div><div><span>Orders added after it</span><strong>{diff.order_append.available?diff.order_append.count:'—'}</strong></div></div>{diff.order_append.available&&<DataTable rows={diff.order_append.rows} columns={diff.order_append.columns} filters={{}} openFilter={()=>{}} filterable={false} name={`Orders after ${diff.order_append.anchor_order}`}/>}</section>}{view==='changes'?<><DataTable rows={matchedComparison} columns={table.columns} filters={filters} openFilter={setFilterColumn} name={`Matched orders · ${diff?.previous||'Previous'} and ${diff?.latest||'Latest'}`}/><DataTable rows={missingComparison} columns={table.columns} filters={filters} openFilter={setFilterColumn} name="Missing Previews"/></>:<DataTable rows={filtered} columns={table.columns} filters={filters} openFilter={setFilterColumn} name={preview.name||'Queue'}/>}</>}
+      {!['daily','monthly','capacity'].includes(view)&&<div className={view==='changes'?'metrics changes-metrics':'metrics'}>{view==='changes'?comparisonGroups.map(({key,title,color})=><button type="button" className={`metric metric-action ${color}`} key={key} aria-controls={`changes-orders-group-${key}`} disabled={!diff||compareBusy||loading} onClick={()=>showComparisonGroup(key)}><span>{title}</span><strong>{diff?.record_counts?.[key]??'—'}</strong></button>):overviewMetrics.map(([title,value,color])=><div className={`metric ${color}`} key={title}><span>{title}</span><strong>{value}</strong></div>)}</div>}
+      {!['daily','monthly','capacity'].includes(view)&&<div className="filter-toolbar"><div className="search-input"><Search size={16}/><input aria-label="Search rows" placeholder="Search all columns" value={search} onChange={e=>setSearch(e.target.value)}/></div><select aria-label="Choose column filter" value={filterColumn||''} onChange={e=>setFilterColumn(e.target.value||null)}><option value="">Filter a column…</option>{table.columns.map(c=><option key={c}>{c}</option>)}</select>{Object.keys(filters).map(c=><button className="filter-chip" key={c} onClick={()=>setFilterColumn(c)}><Filter size={12}/>{c}</button>)}{Object.keys(filters).length>0&&<button className="text-button" onClick={()=>setFilters({})}>Clear filters</button>}<span className="row-tally">{filtered.length.toLocaleString()} / {table.rows.length.toLocaleString()} rows</span>{view!=='changes'&&preview.id&&<><button className="secondary" onClick={exportSheets} disabled={exporting||running}><ArrowDownToLine size={16}/>Production Excel</button><button className="secondary" onClick={()=>csvDownload(filtered,table.columns,`${view}.csv`)}>CSV</button></>}</div>}
+      {(loading||(view==='changes'&&compareBusy))?<LoadingScreen title="Loading preview…"/>:<><div className={filterColumn?'data-layout with-filter':'data-layout'}><div className="data-main">{view==='sheets'&&<StatusReport rows={filtered}/>}
+        {['daily','monthly'].includes(view)&&reportMode!=='excel'&&<div className="notice" role="status">Daily Orders and Monthly Orders are available in Import Excel report. Select Import Excel report to view these reports.</div>}{view==='daily'&&reportMode==='excel'&&<DailyOrders key={reportMode} revision={sourceKey} preview={preview} running={running}/>}
+        {view==='monthly'&&reportMode==='excel'&&<MonthlyOrders key={sourceKey} preview={preview} running={running} reportMode={reportMode}/>}
+        {view==='capacity'&&<CapacityReport revision={sourceKey} running={running}/>}
+        {['daily','monthly','capacity'].includes(view) ? null : productSplit ? <>
+          <DataTable rows={filtered} columns={table.columns} filters={filters} openFilter={setFilterColumn} name={'Production trackers'}/>
+          <DataTable rows={liveFull?liveFull.rows.filter(row=>matches(row,filters)&&(!search||liveFull.columns.some(column=>str(row[column]).toLowerCase().includes(search.toLowerCase())))):productSplit.fullTitle} columns={liveFull?.columns||table.columns} filters={liveFull?{}:filters} openFilter={setFilterColumn} name={'Full Title'}/>
+          <DataTable rows={liveRemaining?liveRemaining.rows.filter(row=>matches(row,filters)&&(!search||liveRemaining.columns.some(column=>str(row[column]).toLowerCase().includes(search.toLowerCase())))):productSplit.remaining} columns={liveRemaining?.columns||table.columns} filters={liveRemaining?{}:filters} openFilter={setFilterColumn} name={'Remaining Products'}/>
+        </> : <>{view==='changes'&&diff?.order_append&&<section className="order-append"><div className="order-append-summary"><div><span>Previous last order</span><strong>{diff.order_append.anchor_order||'Not available'}</strong></div><div><span>First new order</span><strong>{diff.order_append.first_added_order||'—'}</strong></div><div><span>Latest new order</span><strong>{diff.order_append.latest_added_order||'—'}</strong></div><div><span>Orders added after it</span><strong>{diff.order_append.available?diff.order_append.count:'—'}</strong></div></div>{diff.order_append.available&&<DataTable rows={diff.order_append.rows} columns={diff.order_append.columns} filters={{}} openFilter={()=>{}} filterable={false} name={`Orders after ${diff.order_append.anchor_order}`}/>}</section>}{view==='changes'?<>{comparisonGroups.map(({key,title,rows})=><DataTable key={key} id={`changes-orders-group-${key}`} rows={rows} columns={table.columns} filters={filters} openFilter={setFilterColumn} name={`${title} · ${rows.length}`}/>)}</>:<DataTable rows={filtered} columns={table.columns} filters={filters} openFilter={setFilterColumn} name={view==='audit'?'Local sync activity':view==='captureDetail'?'Saved capture':'Production trackers'}/>}</>}
       </div>{filterColumn&&<FilterPanel key={filterColumn} column={filterColumn} rows={table.rows} filters={filters} setFilters={setFilters} close={()=>setFilterColumn(null)}/>}</div></>}
       </>}
-      <footer className="page-footer"><span>DataTrace Workspace</span><span>{state.previews.length} saved previews · Local storage</span></footer></div>
+      </React.Suspense><footer className="page-footer"><span>Tv Tracker · Your local production workspace</span><span>{state.pending_sync>0?`${state.pending_sync} pending sync · `:''}{state.previews.length} saved captures · Local storage</span></footer></div>
     </main>
+    <ActivityPanel job={state.job} startingExtraction={extractionRequest.pending} extractionError={extractionRequest.error} onCancel={cancelExtraction} cancelling={cancelling} connectionError={connectionError} busy={running||loading||compareBusy||refreshingProduction||exporting} title={uploading?'Importing files…':pending&&!state.job.running?'Starting operation…':state.job.running?state.job.stage:loading?'Loading capture…':compareBusy?'Comparing captures…':refreshingProduction?'Refreshing production…':exporting?'Exporting report…':'Workspace ready'} error={connectionError||result?.error} cancelled={result?.cancelled} pendingSync={state.pending_sync||0}/>
   </div>;
 }
-createRoot(document.getElementById('root')).render(<App/>);
+createRoot(document.getElementById('root')).render(<ActivityProvider><WorkspaceBoundary><React.Suspense fallback={<LoadingScreen title="Opening workspace…"/>}><App/></React.Suspense></WorkspaceBoundary></ActivityProvider>);
 

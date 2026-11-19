@@ -1,31 +1,100 @@
 """Local React dashboard API. The server deliberately starts with no seed data."""
 import argparse
+from collections import deque
 from datetime import datetime, timedelta, timezone
 import json
 import os
 import re
+import secrets
 import socket
+import hmac
 from io import BytesIO
 from pathlib import Path
 import threading
 import time as clock
 from urllib.parse import urlparse
 
-from flask import Flask, jsonify, request, send_file, send_from_directory
+from flask import Flask, g, jsonify, request, send_file, send_from_directory
 import pandas as pd
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
-from datatrace_sync import run_sync, sync_workbook, apply_status_rules, build_synced_workbook_stream, target_worksheet
+from datatrace_sync import run_sync, sync_workbook, target_worksheet, CaptureCancelled
 from reporting_dates import reporting_date
 from preview_store import PreviewStore, compare
 from order_reporting import automatic_sync_frame, daily_orders, monthly_orders, AUTOMATIC_RULES, completion_history
-from sync_config import BASE_DIR, TARGET_GSHEET_URL
-from sla_comments import sla_key, sla_status
+from sync_config import BASE_DIR, ASSET_DIR, SPREADSHEET_ID, TARGET_GSHEET_URL, TRACKER_TITLES
+from production_cache import ProductionCache
+from operation_journal import OperationJournal
+from request_metrics import RequestMetrics
+from tracker_sync import read_tracker_rows, read_preview_history, tracker_sources, TRACKERS, FULL, REMAINING, HEADERS, sheet_reports, read_pass_report, received_at
 from indian_clock import IndianClock
+from sla_comments import sla_key, sla_status
 
 IST = timezone(timedelta(hours=5, minutes=30), 'IST')
 SETTINGS_SHEET = '__DataTrace_Config'
-from tracker_sync import TRACKERS, HEADERS, FULL, REMAINING, records, read_trackers, sheet_reports, sync_trackers, read_pass_report
+
+
+def sync_retry_delay(error, attempt):
+    """A per-minute Sheets quota cannot recover after a one-second retry."""
+    code = getattr(error, 'code', None) or getattr(getattr(error, 'response', None), 'status_code', None)
+    message = str(error).casefold()
+    return 60 if code == 429 or 'http 429' in message or 'quota exceeded' in message else 2 ** attempt
+
+
+def compact_job(job):
+    """Keep polling small; the full immutable report remains available from sync-reports."""
+    result = job.get('result')
+    if not result or not isinstance(result.get('pass_report'), dict):
+        return job
+    report = result['pass_report']
+    summary = {key: value for key, value in report.items() if isinstance(value, (str, int, float, bool)) or value is None}
+    for key in ('not_in_latest', 'ambiguous', 'unprocessed'):
+        value = report.get(key, 0)
+        summary[key + '_count'] = len(value) if isinstance(value, list) else value if isinstance(value, int) else 0
+    return dict(job, result=dict(result, pass_report=summary))
+
+
+def color_export_sheet(ws, values):
+    from openpyxl.styles import PatternFill, Font
+    from datatrace_sync import status_color
+    from tracker_formatting import foreground
+    if not values:
+        return
+    headers = values[0]
+    status_column = next((headers.index(name) for name in ('Status', 'Task Status') if name in headers), None)
+    if status_column is None:
+        return
+    styles = {}
+    # Indexing ws[number] recalculates max_column by scanning every populated
+    # cell for every row. Explicit bounds keep large archive exports linear.
+    rows = ws.iter_rows(min_row=2, max_row=len(values), max_col=len(headers))
+    for cells, output_row in zip(values[1:], rows):
+        color = status_color(cells[status_column] if len(cells) > status_column else '')
+        if color not in styles:
+            styles[color] = (PatternFill('solid', fgColor=color.lstrip('#').upper()),
+                             Font(color=foreground(color).lstrip('#').upper()))
+        fill, font = styles[color]
+        for cell in output_row:
+            cell.fill = fill
+            cell.font = font
+
+
+def production_export_frames(book, store=None, sources=None):
+    from datatrace_sync import status_report_frame
+    from monthly_production import decode, tab_identity, arrival_sort, encode
+    sources = tracker_sources(book) if sources is None else sources
+    if not sources:
+        return {}
+    frames = {sheet.title: encode(arrival_sort(decode(values)), values[0]) if values else [] for _, sheet, values in sources}
+    trackers = {sheet.title if tab_identity(sheet.title) else title: decode(values) for title, sheet, values in sources}
+    rows = [row for values in trackers.values() for row in values if row.get('Order Number')]
+    reports = sheet_reports(trackers, read_pass_report(book, store))
+    status = status_report_frame(pd.DataFrame(rows, columns=list(dict.fromkeys(HEADERS + [c for row in rows for c in row]))))
+    frames['Status Report'] = [list(status.columns)] + status.fillna('').values.tolist()
+    for title, kind, period in (('Daily Orders', 'daily', 'Date'), ('Monthly report', 'monthly', 'Month')):
+        columns = [period, 'Today Orders' if kind == 'daily' else 'Month Orders', 'Completed Orders', 'Not in latest preview', 'Awaiting for Clarification', 'SLA On Time', 'SLA Missed']
+        frames[title] = [columns] + [[row.get(c, '') for c in columns] for row in reports[kind]]
+    return frames
 
 
 def workbook(frame, name):
@@ -48,13 +117,52 @@ def workbook(frame, name):
 
 def create_app(root=None, runner=None, syncer=None, start_scheduler=False, time_source=None):
     app = Flask(__name__, static_folder=None)
+    metrics = RequestMetrics()
+
+    @app.before_request
+    def begin_request_timing():
+        g.request_started = clock.perf_counter()
+
+    @app.after_request
+    def finish_request_timing(response):
+        if request.url_rule:
+            metrics.record(request.url_rule.rule, (clock.perf_counter() - g.request_started) * 1000, response.status_code)
+        return response
+    desktop_mode = os.environ.get('DATATRACE_DESKTOP') == '1'
+    desktop_token = os.environ.get('DATATRACE_DESKTOP_TOKEN', '')
+    if desktop_mode and not desktop_token:
+        raise RuntimeError('Desktop authentication is required.')
     app.config['MAX_CONTENT_LENGTH'] = 20 * 1024 * 1024
     store = PreviewStore(root or BASE_DIR / 'previews')
-    runner = runner or run_sync
+    from report_workspace import ReportWorkspace
+    report_workspace = ReportWorkspace(store)
+    journal = OperationJournal(store)
+    cancel_capture = threading.Event()
+    sheet_sync_enabled = False
+
+    @app.route('/api/sheet-sync', methods=['GET', 'POST'])
+    def sheet_sync_setting():
+        nonlocal sheet_sync_enabled
+        from flask import request, jsonify
+        if request.method == 'POST':
+            sheet_sync_enabled = (request.get_json(silent=True) or {}).get('enabled') is True
+        return jsonify(enabled=sheet_sync_enabled)
+
+    @app.before_request
+    def enforce_manual_sheet_sync():
+        from flask import request, jsonify
+        if request.method == 'POST' and request.path in ('/api/sync', '/api/report-publish') and not sheet_sync_enabled:
+            return jsonify(error='Turn Sheet_sync On before manually syncing.'), 409
+
+    runner = runner or (lambda on_progress: run_sync(on_progress=on_progress, auto_sync=False, cancel_event=cancel_capture))
     syncer = syncer or sync_workbook
     indian_clock = time_source or IndianClock()
     app.extensions['indian_clock'] = indian_clock
+    sync_queue, queued_ids = deque(), set()
+    queue_lock = threading.Lock()
+    worker_active = False
     gate = threading.Lock()
+    import_lock = threading.Lock()
     state_lock = threading.Lock()
     schedule_lock = threading.Lock()
     state = {'running': False, 'stage': 'Ready', 'action': None, 'result': None, 'run_id': 0}
@@ -63,6 +171,222 @@ def create_app(root=None, runner=None, syncer=None, start_scheduler=False, time_
     preview_recovery_lock = threading.Lock()
     snapshot_lock = threading.Lock()
     snapshot_cache = {'checked': float('-inf'), 'signature': None, 'snapshot': None}
+    recovery_checked = float('-inf')
+    connection_retry_after = float('-inf')
+    scheduler_stop = threading.Event()
+    maintenance = threading.Event()
+    app.extensions['stop_scheduler'] = scheduler_stop
+    production_cache = ProductionCache(store.root.parent / 'production-cache.json', '|'.join((SPREADSHEET_ID, *TRACKER_TITLES)))
+    app.extensions['production_cache'] = production_cache
+
+    import secrets
+    local_settings_token = secrets.token_urlsafe(32)
+
+    @app.before_request
+    def local_settings_security():
+        if not request.path.startswith('/api/local/'):
+            return
+        if (desktop_mode or os.environ.get('RENDER') or
+                request.remote_addr not in ('127.0.0.1', '::1') or
+                urlparse(request.host_url).hostname not in ('127.0.0.1', 'localhost', '::1')):
+            return jsonify(error='Connections can only be managed from this computer.'), 403
+        origin = request.headers.get('Origin')
+        if (origin and origin != request.host_url.rstrip('/')) or request.headers.get('Sec-Fetch-Site') == 'cross-site':
+            return jsonify(error='Open settings from the local workspace.'), 403
+        request.max_content_length = 128 * 1024
+        if request.method != 'GET' and (not request.is_json or not hmac.compare_digest(
+                request.headers.get('X-Settings-Token', ''), local_settings_token)):
+            return jsonify(error='Reopen Connections & settings and try again.'), 403
+
+    @app.get('/api/local/settings')
+    def get_local_settings():
+        import local_settings
+        import sync_config
+        return jsonify(**local_settings.public(local_settings.current(sync_config)), csrfToken=local_settings_token)
+
+    @app.post('/api/local/settings')
+    def save_local_settings():
+        nonlocal recovery_checked, cloud_schedule_loaded, connection_retry_after
+        if not gate.acquire(blocking=False):
+            return jsonify(error='Wait for the current capture or sync to finish before saving connections.'), 409
+        try:
+            with state_lock:
+                if state['running'] or queued_ids:
+                    return jsonify(error='Wait for queued syncs to finish before saving connections.'), 409
+            import importlib
+            import sys
+            import local_settings
+            import sync_config
+            import datatrace_sync
+            import tracker_sync
+            import monthly_production
+            import sheets_repository
+            previous_spreadsheet = sync_config.SPREADSHEET_ID
+            settings = local_settings.validate(request.get_json(), local_settings.current(sync_config))
+            local_settings.save(BASE_DIR, settings)
+            importlib.reload(sync_config)
+            # These modules retain imported connection constants; update them together
+            # while capture/sync work is excluded, then discard connection-specific caches.
+            for module in (sys.modules[__name__], datatrace_sync, tracker_sync, monthly_production, sheets_repository):
+                for name in ('SPREADSHEET_ID', 'TARGET_GSHEET_URL', 'WORKSHEET_GID', 'TRACKER_TITLES',
+                             'FULL_TRACKER_TITLE', 'REMAINING_TRACKER_TITLE'):
+                    if hasattr(module, name):
+                        setattr(module, name, getattr(sync_config, name))
+            for module in (sys.modules[__name__], tracker_sync):
+                module.FULL, module.REMAINING = sync_config.TRACKER_TITLES
+                module.TRACKERS = sync_config.TRACKER_TITLES
+            monthly_production.BASES = sync_config.TRACKER_TITLES
+            production_cache.identity = '|'.join((sync_config.SPREADSHEET_ID, *sync_config.TRACKER_TITLES))
+            production_cache.reload()
+            if settings['spreadsheetId'] != previous_spreadsheet:
+                report_workspace.save(cloud_baseline=None, tracker_status_baseline=None, cloud_reset=True, synced_at=None,
+                                      cloud_refresh_error=None)
+            recovery_checked, cloud_schedule_loaded = float('-inf'), False
+            connection_retry_after = float('-inf')
+            invalidate_snapshot()
+            return jsonify(**local_settings.public(settings), csrfToken=local_settings_token)
+        finally:
+            gate.release()
+
+    @app.post('/api/local/check-connection')
+    def check_local_connection():
+        if not gate.acquire(blocking=False):
+            return jsonify(error='Wait for the current capture or sync to finish before testing the connection.'), 409
+        try:
+            book, _ = target_worksheet()
+            titles = {sheet.title for sheet in book.worksheets()}
+            missing = [title for title in TRACKER_TITLES if title not in titles]
+            return jsonify(connected=True, title=book.title, missingTrackers=missing)
+        except Exception as exc:
+            return jsonify(error=str(exc)), 502
+        finally:
+            gate.release()
+
+    def finish_operation(number):
+        if number is not None:
+            try:
+                journal.finish(number, state.get('result'))
+            except Exception:
+                app.logger.exception('Could not finish the local operation receipt')
+                state.update(stage='Local receipt needs attention', result={
+                    **(state.get('result') or {}),
+                    'error': 'The operation finished but its local activity receipt could not be saved. Check free disk space before continuing.'})
+
+    @app.get('/api/activity')
+    def activity():
+        return jsonify(operations=journal.list())
+
+    @app.get('/api/order-history')
+    def order_history():
+        number = request.args.get('order', '').strip()
+        if not number or len(number) > 512:
+            raise ValueError('A valid order number is required.')
+        with store.connect() as db:
+            rows = db.execute("WITH recent AS (SELECT id,created,rows_json FROM previews ORDER BY id DESC LIMIT 100) "
+                              "SELECT recent.id,recent.created,group_concat(DISTINCT json_extract(item.value,'$.Status')) "
+                              "FROM recent,json_each(recent.rows_json) item "
+                              "WHERE lower(trim(CAST(json_extract(item.value,'$.\"Order Number\"') AS TEXT)))=lower(?) "
+                              "GROUP BY recent.id,recent.created ORDER BY recent.id DESC", (number,)).fetchall()
+        return jsonify(events=[{'preview_id': row[0], 'preview_name': f'preview{row[0]}',
+                                'created': row[1], 'status': row[2]} for row in rows], capture_limit=100)
+
+    @app.get('/api/desktop/diagnostics')
+    def diagnostics():
+        # An allowlist deliberately excludes logs, paths, URLs, account identifiers and order contents.
+        with state_lock:
+            active = bool(state['running'])
+        return jsonify(format='tv-tracker-diagnostics', version=1, created=journal.now(),
+                       captures=len(store.list()), pending_sync=store.pending_count(),
+                       failed_syncs=len(store.failed_syncs()), active_operation=active,
+                       schedule={'timezone': 'Asia/Kolkata', 'catch_up': 'one run for all missed times today'},
+                       operations=journal.list(), request_metrics=metrics.snapshot())
+
+    @app.before_request
+    def desktop_security():
+        if desktop_mode and not hmac.compare_digest(request.headers.get('X-DataTrace-Token', ''), desktop_token):
+            return jsonify(error='Open this workspace in DataTrace Studio.'), 401
+        if request.path.startswith('/api/desktop/') and not desktop_mode:
+            return jsonify(error='This action is available in the desktop app.'), 404
+        if maintenance.is_set() and request.path not in ('/api/health', '/api/desktop/shutdown'):
+            return jsonify(error='The local workspace is being restored. Try again in a moment.'), 503
+        if request.path == '/api/desktop/restore':
+            request.max_content_length = 100 * 1024 * 1024
+
+    @app.after_request
+    def response_security(response):
+        response.headers['X-Content-Type-Options'] = 'nosniff'
+        response.headers['Referrer-Policy'] = 'no-referrer'
+        if desktop_mode:
+            response.headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
+        if request.path.startswith('/api/'):
+            response.headers['Cache-Control'] = 'no-store'
+        return response
+
+    @app.get('/api/health')
+    def health():
+        with state_lock:
+            return jsonify(ready=True, running=state['running'] or bool(queued_ids), stage=state['stage'], desktop=desktop_mode)
+
+    @app.post('/api/desktop/shutdown')
+    def shutdown_desktop():
+        options = request.get_json(silent=True) or {}
+        force = bool(options.get('force'))
+        if force and options.get('backup'):
+            return jsonify(error='An update backup requires an idle workspace.'), 422
+        if not force and not gate.acquire(blocking=False):
+            return jsonify(error='Wait for the current capture or sync to finish before installing or quitting.'), 409
+        with state_lock:
+            if (state['running'] or queued_ids) and not force:
+                gate.release()
+                return jsonify(error='A job is running.'), 409
+            maintenance.set()
+        if options.get('backup'):
+            try:
+                from workspace_backup import make_backup
+                stamp = datetime.now().strftime('%Y%m%d-%H%M%S-%f')
+                destination = store.root.parent / 'backups' / f'before-update-{stamp}.zip'
+                destination.parent.mkdir(exist_ok=True)
+                temporary = destination.with_suffix('.tmp')
+                temporary.write_bytes(make_backup(store).getvalue())
+                temporary.replace(destination)
+            except Exception:
+                maintenance.clear()
+                gate.release()
+                return jsonify(error='The update backup could not be saved. Check free disk space and retry.'), 503
+        scheduler_stop.set()
+        callback = app.config.get('DESKTOP_SHUTDOWN')
+        if callback:
+            threading.Timer(0.15, callback).start()
+        return jsonify(stopping=True)
+
+    @app.get('/api/desktop/backup')
+    def desktop_backup():
+        from workspace_backup import make_backup
+        if not gate.acquire(blocking=False):
+            return jsonify(error='Wait for the current job before backing up.'), 409
+        try:
+            return send_file(make_backup(store), as_attachment=True, download_name='DataTrace-backup.zip', mimetype='application/zip')
+        finally:
+            gate.release()
+
+    @app.post('/api/desktop/restore')
+    def desktop_restore():
+        from workspace_backup import restore_backup
+        if not gate.acquire(blocking=False):
+            return jsonify(error='Wait for the current job before restoring.'), 409
+        try:
+            maintenance.set()
+            with import_lock:
+                safety = restore_backup(store, request.get_data())
+                journal.__init__(store)
+                report_workspace.__init__(store)
+            invalidate_snapshot()
+            production_cache.reload()
+            production_cache.invalidate()
+            return jsonify(restored=True, safety_backup=safety)
+        finally:
+            maintenance.clear()
+            gate.release()
 
     def invalidate_snapshot():
         with snapshot_lock:
@@ -77,45 +401,42 @@ def create_app(root=None, runner=None, syncer=None, start_scheduler=False, time_
             previews = store.list()
             signature = tuple((p['id'], p['created'], p['source'], p['row_count']) for p in previews)
             if signature != snapshot_cache['signature']:
-                history = store.history()
-                previews = [{'id': p['id'], 'name': p['name'], 'created': p['created'],
-                             'source': p['source'], 'row_count': len(p['rows'])}
-                            for p in sorted(history, key=lambda p: p['id'], reverse=True)]
-                reports = daily_orders(store, history=history)
+                history = None
+                reports = []
                 snapshot_cache['snapshot'] = (previews, history, reports)
                 snapshot_cache['signature'] = tuple((p['id'], p['created'], p['source'], p['row_count']) for p in previews)
             snapshot_cache['checked'] = clock.monotonic()
             return snapshot_cache['snapshot']
 
-    def recover_latest_preview():
-        if root is not None or reporting_snapshot()[0]:
+    def recover_latest_preview(required=False):
+        nonlocal recovery_checked
+        if root is not None or reporting_snapshot()[0] or (desktop_mode and not required):
             return
         with preview_recovery_lock:
-            if store.list():
+            if not required and clock.monotonic() - recovery_checked < 60:
+                return
+            recovery_checked = clock.monotonic()
+            if store.list() or not store.auto_recover():
                 return
             try:
                 book, _ = target_worksheet()
-                values = book.worksheet('Sheet1').get_all_values()
-                if values and 'Preview' in values[0]:
-                    columns = [c for c in values[0] if c not in ('Preview', 'Preview Timestamp')]
-                    grouped = {}
-                    for row in records(values):
-                        match = re.fullmatch(r'preview([1-9]\d*)', row.get('Preview', ''))
-                        if match:
-                            grouped.setdefault(int(match[1]), []).append(row)
-                    for number, rows in grouped.items():
-                        when = rows[0].get('Preview Timestamp', '')
-                        created = datetime.fromisoformat(when).replace(tzinfo=IST).isoformat() if when else None
-                        original = [{c: row.get(c, '') for c in columns} for row in rows if row.get('Order Number')]
-                        store.restore(number, columns, original, created=created)
-                        store.mark_synced(number)
+                store.recover_cloud_previews(read_preview_history(book))
                 invalidate_snapshot()
-            except Exception:
-                app.logger.exception('Could not recover previews from raw Google Sheet history')
+            except Exception as exc:
+                app.logger.exception('Could not recover latest preview from Google Sheets')
+                if required:
+                    if desktop_mode and not (SPREADSHEET_ID and os.environ.get('GOOGLE_SERVICE_ACCOUNT_JSON')):
+                        raise RuntimeError('Open Connections & settings, enter your spreadsheet URL, import the service-account JSON key, and Save settings. Sharing the Sheet alone does not configure this app.') from exc
+                    detail = (str(exc) if isinstance(exc, RuntimeError) else
+                              f'Cloud preview history could not be read ({type(exc).__name__}).')
+                    raise RuntimeError(f'Could not recover existing preview numbers from Google Sheets. {detail} '
+                                       'No new capture was created.') from exc
 
     def load_schedule():
         nonlocal cloud_schedule_loaded
-        default = {'enabled': False, 'time': '09:00', 'times': ['09:00'], 'last_triggered_date': None, 'triggered_today': [], 'timezone': 'Asia/Kolkata'}
+        default = {'enabled': False, 'time': '09:00', 'times': ['09:00'], 'days': list(range(7)),
+                   'last_triggered_date': None, 'triggered_today': [], 'timezone': 'Asia/Kolkata',
+                   'cleared_attempt_at': None, 'cleared_success_at': None}
         if os.environ.get('RENDER') and not cloud_schedule_loaded:
             try:
                 book, _ = target_worksheet()
@@ -144,6 +465,11 @@ def create_app(root=None, runner=None, syncer=None, start_scheduler=False, time_
                 elif 'time' in saved and saved['time']:
                     default['times'] = [str(saved['time']).strip()]
                     default['time'] = default['times'][0]
+                days = saved.get('days')
+                if isinstance(days, list) and days and all(type(day) is int and 0 <= day <= 6 for day in days):
+                    default['days'] = sorted(set(days))
+                else:
+                    default['days'] = list(range(7))
         except (OSError, ValueError):
             pass
         default['timezone'] = 'Asia/Kolkata'
@@ -160,7 +486,10 @@ def create_app(root=None, runner=None, syncer=None, start_scheduler=False, time_
         times = sorted(list(dict.fromkeys([str(t).strip() for t in times if str(t).strip()])))
         schedule['times'] = times
         schedule['time'] = times[0] if times else '09:00'
-        schedule_path.write_text(json.dumps(schedule, indent=2), encoding='utf-8')
+        schedule['days'] = sorted(set(schedule.get('days', range(7))))
+        temporary = schedule_path.with_suffix('.tmp')
+        temporary.write_text(json.dumps(schedule, indent=2), encoding='utf-8')
+        temporary.replace(schedule_path)
         if os.environ.get('RENDER'):
             book, _ = target_worksheet()
             from gspread.exceptions import WorksheetNotFound
@@ -175,13 +504,12 @@ def create_app(root=None, runner=None, syncer=None, start_scheduler=False, time_
         previews, history, reports = reporting_snapshot()
         if not previews:
             raise ValueError('Capture or import a preview before syncing Google Sheets.')
-        by_id = {p['id']: p for p in history}
-        selected_preview = by_id[int(preview_id) if preview_id is not None else previews[0]['id']]
+        selected_preview = store.get(int(preview_id) if preview_id is not None else previews[0]['id'])
         if previous_id is None:
             previous_id = next((item['id'] for item in previews if item['id'] < selected_preview['id']), None)
         if previous_id is not None and int(previous_id) >= selected_preview['id']:
             raise ValueError('The previous preview must be older than the selected preview.')
-        previous_preview = by_id[int(previous_id)] if previous_id is not None else None
+        previous_preview = store.get(int(previous_id)) if previous_id is not None else None
         frame, completed_orders = automatic_sync_frame(selected_preview, previous_preview, keys, ignore,
                                                        store=store, reports=reports)
         frame.attrs['preview_name'] = selected_preview['name']
@@ -196,24 +524,39 @@ def create_app(root=None, runner=None, syncer=None, start_scheduler=False, time_
         return frame, selected_preview, completed_orders, previous_id
 
     def begin_sync(trigger='manual', preview_id=None, previous_id=None, keys=None, ignore=None, remaining_products=None):
+        if trigger != 'manual' or not sheet_sync_enabled:
+            return False
+        nonlocal worker_active
+        preview_id = int(preview_id) if preview_id is not None else None
+
         def work():
-            gate.acquire()  # Queue behind an extraction or another sync; do not drop previews.
+            operation_id = None
+            while not scheduler_stop.is_set():
+                if gate.acquire(timeout=0.2):
+                    break
+            else:
+                return
             with state_lock:
                 state.update(running=True, action='sync', stage='Preparing Google Sheets sync', result=None,
                              run_id=state['run_id'] + 1)
             try:
-                frame, selected_preview, completed_orders, prior_id = prepare_sync(preview_id, previous_id, keys, ignore, remaining_products)
+                operation_id = journal.begin('sync')
+                mapping = (reconcile_pending_previews(allow_empty=True).get('mapping', {})
+                           if trigger == 'manual' and syncer is sync_workbook else {})
+                target_id = mapping.get(preview_id, preview_id)
+                target_previous = mapping.get(previous_id, previous_id)
+                frame, selected_preview, completed_orders, prior_id = prepare_sync(target_id, target_previous, keys, ignore, remaining_products)
                 with state_lock:
                     state['stage'] = f"Syncing {selected_preview['name']} to Google Sheets"
+                drain_earlier_previews(frame.attrs['preview_id'], retry_failed=trigger == 'manual')
                 worksheets = upload_sync(frame)
                 result = {'action': 'sync', 'trigger': trigger, 'error': None,
                           'google_sheet': 'success', 'preview_id': selected_preview['id'],
                           'preview_name': selected_preview['name'], 'rows': len(frame),
-                          'worksheets': worksheets, 'stage': 'Finished'}
+                          'worksheets': worksheets, 'pass_report': frame.attrs.get('pass_report'), 'stage': 'Finished'}
                 result['status_rules'] = AUTOMATIC_RULES
                 result['completed_orders'] = len(completed_orders)
                 result['previous_id'] = prior_id
-                result['pass_report'] = frame.attrs.get('pass_report', {})
                 with state_lock:
                     state.update(result=result, stage='Finished')
             except Exception as exc:
@@ -223,52 +566,102 @@ def create_app(root=None, runner=None, syncer=None, start_scheduler=False, time_
                                  'google_sheet': 'failed', 'error': str(exc)})
             finally:
                 with state_lock:
+                    finish_operation(operation_id)
                     state['running'] = False
-                gate.release()
-        threading.Thread(target=work, daemon=True).start()
+                    gate.release()
+        def drain_queue():
+            nonlocal worker_active
+            while True:
+                with queue_lock:
+                    if not sync_queue or scheduler_stop.is_set():
+                        sync_queue.clear()
+                        queued_ids.clear()
+                        worker_active = False
+                        return
+                    number, task = sync_queue.popleft()
+                try:
+                    task()
+                finally:
+                    with queue_lock:
+                        queued_ids.discard(number)
+
+        with queue_lock:
+            if preview_id in queued_ids:
+                return trigger != 'manual'
+            if len(sync_queue) >= 100:
+                return False  # The capture stays durable for the scheduler to pick up.
+            queued_ids.add(preview_id)
+            sync_queue.append((preview_id, work))
+            if not worker_active:
+                worker_active = True
+                threading.Thread(target=drain_queue, daemon=True).start()
         return True
 
-    def upload_sync(frame):
+    def upload_sync(frame, publish=True):
+        # The report publisher rebuilds all views from the committed trackers.
+        # Keep the capture transaction small and publish those views once.
+        if syncer is sync_workbook and (not publish or report_workspace.read().get('enabled')):
+            frame.attrs['defer_report_views'] = True
         def progress(stage):
             with state_lock:
                 state['stage'] = stage
-        # Process pending snapshots chronologically before the selected capture.
-        # This also handles previews saved by an external extraction process.
-        for number in store.pending_syncs():
-            if number < frame.attrs['preview_id']:
-                prior, _ = automatic_sync_frame(store.get(number), store=store)
-                upload_one(prior, progress)
-        return upload_one(frame, progress)
-
-    def upload_one(frame, progress):
+        number = frame.attrs['preview_id']
         for attempt in range(3):
             try:
-                result = syncer(frame, on_progress=progress) if syncer is sync_workbook else syncer(frame)
-                store.mark_synced(frame.attrs['preview_id'])
+                if scheduler_stop.is_set():
+                    raise RuntimeError('Sync interrupted; the capture remains saved.')
+                worksheets = syncer(frame, on_progress=progress) if syncer is sync_workbook else syncer(frame)
+                store.mark_synced(number, frame.attrs.get('pass_report', {}))
                 invalidate_snapshot()
-                return result
+                production_cache.invalidate()
+                settings = report_workspace.read()
+                # Captures update tracker storage only while Excel is selected.
+                # Publishing here would also read shared tabs back into the import.
+                if publish and syncer is sync_workbook and settings.get('enabled') and settings['mode'] != 'excel':
+                    app.extensions['publish_active_reports']()
+                return worksheets
             except Exception as exc:
-                if attempt == 2:
-                    store.mark_failed(frame.attrs['preview_id'], str(exc))
+                # Validation/conflict errors need intervention, not automatic retries.
+                if isinstance(exc, (ValueError, KeyError)) or attempt == 2 or scheduler_stop.is_set():
+                    store.mark_failed(number, str(exc))
                     raise
-                progress(f'Sync failed; retrying ({attempt + 2}/3). Preview is saved.')
-                clock.sleep(2 ** attempt)
+                delay = sync_retry_delay(exc, attempt)
+                progress(f'Sync failed; retrying ({attempt + 2}/3) in {delay}s. Preview is saved.')
+                scheduler_stop.wait(delay)
+
+    def drain_earlier_previews(preview_id, retry_failed=False):
+        failures = {row['preview_id'] for row in store.failed_syncs()}
+        for number in store.unsynced_ids():
+            if number >= preview_id:
+                break
+            if number in failures and not retry_failed:
+                raise ValueError(f'preview{number} needs retry before newer captures can sync. Use its Retry sync button.')
+            frame, _, _, _ = prepare_sync(number)
+            frame.attrs['defer_report_views'] = True
+            upload_sync(frame, publish=False)
 
     def begin_scheduled_capture():
         if not gate.acquire(blocking=False):
             return False
         with state_lock:
+            cancel_capture.clear()
             state.update(running=True, action='extract', stage='Scheduled extraction (IST)',
-                         result=None, run_id=state['run_id'] + 1)
+                         result=None, cancel_requested=False, run_id=state['run_id'] + 1)
 
         def work():
             saved_preview = None
+            operation_id = None
             try:
+                operation_id = journal.begin('scheduled_capture')
+                recover_latest_preview(required=True)
                 prior_ids = {item['id'] for item in store.list()}
                 def progress(result):
                     with state_lock:
-                        state.update(stage=result.get('stage', 'Extracting queue'))
-                result = runner(on_progress=progress)
+                        state.update(stage='Cancelling extraction…' if cancel_capture.is_set() else result.get('stage', 'Extracting queue'))
+                with import_lock:
+                    result = runner(on_progress=progress)
+                if result.get('cancelled'):
+                    raise CaptureCancelled()
                 if result.get('error'):
                     raise RuntimeError(result['error'])
                 preview_id = result.get('preview_id')
@@ -276,27 +669,25 @@ def create_app(root=None, runner=None, syncer=None, start_scheduler=False, time_
                     raise RuntimeError('Extraction did not save a new preview; Google Sheets were not changed.')
                 saved_preview = store.get(preview_id)
                 invalidate_snapshot()
-                frame, preview, completed, previous_id = prepare_sync(preview_id)
                 with state_lock:
-                    state.update(action='sync', stage=f"Syncing {preview['name']} to Google Sheets")
-                worksheets = upload_sync(frame)
+                    state.update(stage='Finished', result=dict(result, action='extract', saved_locally=True, google_sheet='manual'))
+            except CaptureCancelled:
                 with state_lock:
-                    state.update(stage='Finished', result={
-                        'action': 'sync', 'trigger': 'schedule', 'error': None,
-                        'google_sheet': 'success', 'preview_id': preview['id'],
-                        'preview_name': preview['name'], 'rows': len(frame),
-                        'worksheets': worksheets, 'completed_orders': len(completed),
-                        'previous_id': previous_id})
+                    state.update(stage='Extraction cancelled', result={'cancelled': True, 'error': None,
+                        'saved_locally': bool(saved_preview), 'preview_id': saved_preview['id'] if saved_preview else None,
+                        'preview_name': saved_preview['name'] if saved_preview else None})
             except Exception as exc:
                 app.logger.exception('Scheduled extraction/sync failed')
                 with state_lock:
-                    state.update(stage='Scheduled run failed', result={'action': 'sync',
+                    state.update(stage='Capture saved; Sheets sync needs retry' if saved_preview else 'Scheduled run failed', result={'action': 'sync',
                                  'trigger': 'schedule', 'error': str(exc),
+                                 'saved_locally': bool(saved_preview),
                                  'preview_name': saved_preview['name'] if saved_preview else None})
             finally:
                 with state_lock:
+                    finish_operation(operation_id)
                     state['running'] = False
-                gate.release()
+                    gate.release()
         threading.Thread(target=work, daemon=True).start()
         return True
 
@@ -307,7 +698,7 @@ def create_app(root=None, runner=None, syncer=None, start_scheduler=False, time_
         now = now.astimezone(IST)
         with schedule_lock:
             schedule = load_schedule()
-            if not schedule['enabled']:
+            if not schedule['enabled'] or now.weekday() not in schedule['days']:
                 return False
             today = now.date().isoformat()
             triggered = schedule.get('triggered_today', []) if schedule.get('last_triggered_date') == today else []
@@ -351,8 +742,21 @@ def create_app(root=None, runner=None, syncer=None, start_scheduler=False, time_
         previews, _, daily_reports = reporting_snapshot()
         with state_lock:
             job = dict(state)
+        with queue_lock:
+            job['running'] = job['running'] or bool(queued_ids)
         with schedule_lock:
             schedule = load_schedule()
+        summary = journal.scheduled_summary()
+        if (schedule.get('cleared_attempt_at') and summary['last_attempt'] and
+                summary['last_attempt'] <= schedule['cleared_attempt_at']):
+            for key in ('last_attempt', 'last_status', 'last_finished', 'last_error_code'):
+                summary[key] = None
+        if (schedule.get('cleared_success_at') and summary['last_success'] and
+                summary['last_success'] <= schedule['cleared_success_at']):
+            summary['last_success'] = None
+        schedule.update(summary)
+        if request.args.get('light') == '1':
+            job = compact_job(job)
         remaining_products = []
         try:
             path = BASE_DIR / 'remaining_products.json'
@@ -360,11 +764,13 @@ def create_app(root=None, runner=None, syncer=None, start_scheduler=False, time_
                 remaining_products = json.loads(path.read_text(encoding='utf-8'))
         except Exception:
             pass
-        daily_completed_ids = list(dict.fromkeys(oid for r in daily_reports for oid in r['missing_ids']))
-        return jsonify(previews=previews, job=job, schedule=schedule, clock=indian_clock.snapshot(), sheet_url=TARGET_GSHEET_URL, failed_syncs=store.failed_syncs(),
-                       remaining_products=remaining_products,
+        daily_completed_ids = []
+        return jsonify(previews=previews, job=job, schedule=schedule, clock=indian_clock.snapshot(), failed_syncs=store.failed_syncs(), sheet_url=TARGET_GSHEET_URL,
+                       remaining_products=remaining_products, report_workspace=report_workspace.public(),
                        daily_completed_ids=daily_completed_ids,
-                       capabilities={'status_rules': True, 'automatic_statuses': True})
+                       pending_sync=store.pending_count(), **store.reset_status(),
+                       capabilities={'status_rules': True, 'automatic_statuses': True, 'desktop': desktop_mode,
+                                     'google_configured': bool(SPREADSHEET_ID and os.environ.get('GOOGLE_SERVICE_ACCOUNT_JSON'))})
 
     @app.get('/api/remaining-products')
     def get_remaining_products():
@@ -388,37 +794,85 @@ def create_app(root=None, runner=None, syncer=None, start_scheduler=False, time_
     @app.get('/api/daily-orders')
     def get_daily_orders():
         try:
-            book, sheet_rows, _ = read_sla_sheets()
-            trackers = {t: [r for r in sheet_rows if r['_sheet'] == t] for t in TRACKERS}
-            return jsonify(rows=sheet_reports(trackers, read_pass_report(book, store))['daily'], selected_date=None)
+            snapshot = production_snapshot()
+            workspace_status = report_workspace.read()
+            return jsonify(rows=snapshot['reports']['daily'],
+                           **{key: workspace_status.get(key) for key in ('selected_date', 'highlighted_date', 'publication_state', 'sync_error')},
+                           **{key: snapshot.get(key) for key in ('source', 'mode', 'statuses', 'offline', 'updated_at', 'pending_sync', 'latest_capture_at', 'latest_synced_capture_at')})
         except Exception as exc:
-            return jsonify(error=f'Google Sheet unavailable: {exc}'), 502
+            return jsonify(error=f'Could not read Google Sheets daily orders: {exc}'), 502
 
     def read_sla_sheets():
         book, _ = target_worksheet()
-        sheet_rows, headers = [], {}
-        for title in TRACKERS:
-            values = book.worksheet(title).get_all_values()
-            headers[title] = values[0] if values else []
-            if values:
-                sheet_rows.extend(dict(dict(zip(values[0], row)), _sheet=title, _sheet_row=index)
-                                  for index, row in enumerate(values[1:], start=2))
-        return book, sheet_rows, headers
+        rows = read_tracker_rows(book)
+        from tracker_sync import canonical_headers
+        headers = {sheet.title: canonical_headers(values[0]) if values else [] for _, sheet, values in tracker_sources(book)}
+        return book, rows, headers
 
     def monthly_report(sheet_rows=None, corrections=None):
-        return monthly_orders(store, sheet_rows, history=reporting_snapshot()[1], corrections=corrections)
+        if sheet_rows is None:
+            raise ValueError('Google Sheets tracker rows are required for production reporting.')
+        trackers = {title: [dict(r) for r in sheet_rows if r.get('_tracker', r.get('_sheet')) == title] for title in TRACKERS}
+        return sheet_reports(trackers, store.latest_sync_report())['monthly']
 
     @app.get('/api/monthly-orders')
     def get_monthly_orders():
-        recover_latest_preview()
         try:
-            book, sheet_rows, _ = read_sla_sheets()
-            trackers = {t: [r for r in sheet_rows if r['_sheet'] == t] for t in TRACKERS}
-            rows = sheet_reports(trackers, read_pass_report(book, store))['monthly']
+            snapshot = production_snapshot()
+            received_column = 'Source received date'
+            months = []
+            for month in snapshot['reports']['monthly']:
+                rows = []
+                for row in month['rows']:
+                    received = received_at(row)
+                    rows.append({**row, received_column: received.date().isoformat() if received else ''})
+                columns = list(dict.fromkeys([received_column, *month['columns']]))
+                months.append(dict(month, rows=rows, columns=columns))
+            return jsonify(rows=months, sla_error=None,
+                           **{key: snapshot.get(key) for key in ('source', 'mode', 'statuses', 'offline', 'updated_at', 'pending_sync', 'latest_capture_at', 'latest_synced_capture_at')})
         except Exception as exc:
-            app.logger.warning('Could not refresh monthly SLA from Google Sheets: %s', exc)
-            return jsonify(error=f'Google Sheet unavailable: {exc}'), 502
-        return jsonify(rows=rows, sla_error=None)
+            return jsonify(error=f'Could not read Google Sheets monthly orders: {exc}'), 502
+
+    def update_imported_sla(selection, status):
+        from order_details import edit_events, persist_edit
+        from report_workspace import imported_snapshot
+        from tracker_sync import key, sync_lock
+        from workspace_backup import save_safety_backup
+
+        with sync_lock(store.root), report_workspace.lock:
+            settings = report_workspace.read()
+            imported = settings.get('imported')
+            if settings['mode'] != 'excel' or not imported:
+                return jsonify(error='The imported report changed. Refresh the report before editing.'), 409
+            current = {(row['_record_key'], *sla_key(row)): row['Free Site']
+                       for month in imported_snapshot(imported)['reports']['monthly']
+                       for row in month['sla_rows']}
+            for selected, expected in selection.items():
+                if current.get(selected) not in (expected, status):
+                    return jsonify(error='A selected order or SLA status changed. Refresh the report and try again.'), 409
+
+            events = []
+            rows = []
+            for row in imported['rows']:
+                identity = (key(row), *sla_key(row))
+                if identity in selection and current[identity] != status:
+                    updated = dict(row, **{'Free Site': status})
+                    received = received_at(row)
+                    events.extend(edit_events(row, updated, {'Free Site': status}, 'excel',
+                                              received.date().isoformat() if received else 'Undated',
+                                              'Monthly SLA editor'))
+                    row = updated
+                rows.append(row)
+            if events:
+                save_safety_backup(store, 'before-update')
+                imported = dict(imported, rows=rows, created=datetime.now(timezone.utc).isoformat())
+                settings.update(imported=imported, data_revision=secrets.token_hex(12), publication_state='pending')
+                persist_edit(report_workspace, settings, events)
+            reports = imported_snapshot(imported)['reports']['monthly']
+        production_cache.invalidate()
+        return jsonify(saved=True, updated_count=len(events), rows=reports,
+                       message=f'{len(events)} SLA changes saved to the imported report.' if events else
+                       'The selected orders already have this SLA status.')
 
     @app.post('/api/sla-comments')
     @app.post('/api/sla-comments/bulk')
@@ -430,15 +884,18 @@ def create_app(root=None, runner=None, syncer=None, start_scheduler=False, time_
         orders = body.get('orders') if bulk else [body]
         if not isinstance(orders, list) or not 1 <= len(orders) <= 10000:
             raise ValueError('Select between 1 and 10,000 orders to update.')
-        status = body.get('status')
+        status = 'Missing' if body.get('status') == 'Missed' else body.get('status')
         if status not in ('On Time', 'Missing'):
             raise ValueError('Choose On Time or Missing.')
+        mode = report_workspace.read()['mode']
+        if body.get('mode', 'tracker') != mode:
+            return jsonify(error='The report source changed. Refresh the report before editing.'), 409
         selection = {}
         for order in orders:
             if not isinstance(order, dict):
                 raise ValueError('Each selection must identify an SLA order.')
             identity, completion = order.get('order_number'), order.get('completion_date')
-            expected = order.get('expected_status')
+            expected = 'Missing' if order.get('expected_status') == 'Missed' else order.get('expected_status')
             if not isinstance(identity, str) or not identity.strip() or len(identity) > 512:
                 raise ValueError('A valid order number is required.')
             identity = identity.strip()
@@ -447,13 +904,23 @@ def create_app(root=None, runner=None, syncer=None, start_scheduler=False, time_
             datetime.strptime(completion, '%Y-%m-%d')
             if expected not in ('On Time', 'Missing'):
                 raise ValueError('Each selection must include its current SLA status.')
-            key = (identity, completion)
+            if mode == 'excel':
+                record_key = order.get('record_key')
+                if not isinstance(record_key, str) or not record_key or len(record_key) > 4096:
+                    raise ValueError('A valid imported record identifier is required.')
+                key = (record_key, identity, completion)
+            else:
+                key = (identity, completion)
             if key in selection:
                 raise ValueError('Each order and completion date must be selected only once.')
             selection[key] = expected
         if not gate.acquire(blocking=False):
             return jsonify(error='A sync or extraction is running. Save the SLA change after it finishes.'), 409
         try:
+            if report_workspace.read()['mode'] != mode:
+                return jsonify(error='The report source changed. Refresh the report before editing.'), 409
+            if mode == 'excel':
+                return update_imported_sla(selection, status)
             try:
                 book, sheet_rows, headers = read_sla_sheets()
             except Exception:
@@ -469,12 +936,16 @@ def create_app(root=None, runner=None, syncer=None, start_scheduler=False, time_
                 if current[key] not in (expected, status):
                     return jsonify(error='An SLA status changed since you selected it. No changes were saved. Refresh the report and try again.'), 409
             matching = [row for row in sheet_rows if sla_key(row) in selection]
+            from monthly_production import ARCHIVE
+            if any(row.get('_month') and row['_month'] <= ARCHIVE for row in matching):
+                return jsonify(error='September is archived. SLA changes cannot overwrite the archive.'), 409
             if any('Free Site' not in headers[row['_sheet']] for row in matching):
                 return jsonify(error='The matching Google Sheet is missing its Free Site column. Restore the column before saving.'), 409
             if matching:
                 from gspread.utils import rowcol_to_a1
+                sheet_status = 'Missing' if status == 'Missed' else status
                 updates = [{'range': f"'{row['_sheet']}'!{rowcol_to_a1(row['_sheet_row'], headers[row['_sheet']].index('Free Site') + 1)}",
-                            'values': [[status]]} for row in matching]
+                            'values': [[sheet_status]]} for row in matching]
                 # Read back one column span per tab, keeping URLs small even for
                 # thousands of selected cells spread over both product tabs.
                 spans = {}
@@ -512,7 +983,7 @@ def create_app(root=None, runner=None, syncer=None, start_scheduler=False, time_
                 return jsonify(error=message), 503
             corrections.update({key: status for key in selection})
             for row in matching:
-                row['Free Site'] = status
+                row['Free Site'] = 'Missing' if status == 'Missed' else status
             message = (f'Order {identity} saved as {status} in Google Sheets and report history.' if matching else
                        f'Order {identity} saved as {status} in report history. This order is not in the current Google Sheet; the correction will apply when it is synced again.')
             if bulk:
@@ -523,64 +994,197 @@ def create_app(root=None, runner=None, syncer=None, start_scheduler=False, time_
                     message += f' {sheet_count} also updated in Google Sheets.'
                 if history_count:
                     message += f' {history_count} historical {"order" if history_count == 1 else "orders"} will use the correction when synced again.'
+            production_cache.invalidate()
             return jsonify(saved=True, updated_count=len(selection), rows=monthly_report(sheet_rows, corrections), message=message)
         finally:
             gate.release()
 
+    def tracker_report_state():
+        previews = reporting_snapshot()[0]
+        pending = set(store.unsynced_ids())
+        synced = next((item for item in previews if item['id'] not in pending), None)
+        return {'pending_sync': len(pending),
+                'latest_capture_at': previews[0]['created'] if previews else None,
+                'latest_synced_capture_at': synced['created'] if synced else None}
+
+    def production_snapshot(force=False, known_revision=None, tracker_only=False):
+        from report_workspace import imported_snapshot
+        can_reconcile = not desktop_mode or bool(SPREADSHEET_ID and os.environ.get('GOOGLE_SERVICE_ACCOUNT_JSON'))
+        if not tracker_only and can_reconcile and app.extensions.get('refresh_imported_reports'):
+            app.extensions['refresh_imported_reports']()
+        settings = report_workspace.read()
+        if not tracker_only and settings['mode'] == 'excel' and settings.get('imported'):
+            return dict(imported_snapshot(settings['imported']), data_revision=settings.get('data_revision'))
+        def load():
+            book, _ = target_worksheet()
+            sheets, trackers, groups = {}, {}, {}
+            from monthly_production import decode, tab_identity, arrival_sort, ARCHIVE
+            from tracker_sync import canonical_headers
+            from production_timing import completion_from_out_time
+            for title, sheet, values in tracker_sources(book):
+                identity = tab_identity(sheet.title)
+                rows = [dict(completion_from_out_time(r), _sheet=sheet.title, _tracker=title, _month=identity[1] if identity else '') for r in decode(values)]
+                trackers[sheet.title if identity else title] = rows
+                columns = canonical_headers(values[0]) if values else HEADERS
+                sheets[sheet.title] = {'columns': columns, 'rows': arrival_sort(rows)}
+                label = 'Full Title' if title == FULL else 'Remaining Products'
+                group = groups.setdefault(label, {'columns': [], 'rows': []})
+                group['columns'] = list(dict.fromkeys(group['columns'] + columns))
+                # Archived rows remain available in Monthly reports; Orders shows current ownership.
+                if not identity or identity[1] > ARCHIVE:
+                    group['rows'].extend(rows)
+            sheets.update(groups)
+            for label in ('Full Title', 'Remaining Products'):
+                sheets.setdefault(label, {'columns': HEADERS, 'rows': []})
+                sheets[label]['rows'] = arrival_sort(sheets[label]['rows'])
+            columns = list(dict.fromkeys(c for title in ('Full Title', 'Remaining Products') for c in sheets[title]['columns']))
+            combined = arrival_sort(sheets['Full Title']['rows'] + sheets['Remaining Products']['rows'])
+            from status_updates import full_product
+            for full, label in ((True, 'Full Title'), (False, 'Remaining Products')):
+                sheets[label] = {'columns': columns, 'rows': [row for row in combined if full_product(row) == full]}
+            sheets['Overview'] = sheets['All Products'] = {'columns': columns, 'rows': combined}
+            audit = read_pass_report(book, store)
+            reports = sheet_reports(trackers, audit)
+            return dict(preview_name=audit.get('preview_name'), sheets=sheets, reports=reports,
+                        report_schema=2, source='Google Sheets', offline=False)
+        result = production_cache.get(load, force=force, known_revision=known_revision) if desktop_mode else load()
+        # Recalculate reports saved by earlier versions even while offline.
+        # Raw tracker copies, including archive tabs, remain the authority.
+        if result.get('report_schema') != 2:
+            if result.get('unchanged'):
+                result = production_cache.get(load)
+            from monthly_production import tab_identity
+            from production_timing import completion_from_out_time
+            for sheet in result['sheets'].values():
+                sheet['rows'] = [completion_from_out_time(row) for row in sheet['rows']]
+            trackers = {title: sheet['rows'] for title, sheet in result['sheets'].items()
+                        if title in TRACKERS or tab_identity(title)}
+            if not trackers:
+                from status_updates import full_product
+                combined = result['sheets'].get('All Products', result['sheets'].get('Overview', {})).get('rows', [])
+                trackers = {}
+                for title, label in zip(TRACKERS, ('Full Title', 'Remaining Products')):
+                    group = result['sheets'].get(label)
+                    trackers[title] = group['rows'] if group else [
+                        row for row in combined if full_product(row) == (title == FULL)]
+            result['reports'] = sheet_reports(trackers, store.latest_sync_report())
+            result['report_schema'] = 2
+            result['revision'] = ProductionCache._revision(result)
+        result.update(tracker_report_state())
+        if result.get('unchanged'):
+            return dict(result, mode='tracker', data_revision=settings.get('data_revision'))
+        result['mode'] = 'tracker'
+        result['data_revision'] = settings.get('data_revision')
+        return result
+
     @app.get('/api/live-sheets')
     def get_live_sheets():
+        recover_latest_preview()
         try:
-            book, _ = target_worksheet()
-            trackers = read_trackers(book)
-            sheets = {title: {'columns': list(dict.fromkeys(HEADERS + [c for r in rows for c in r])), 'rows': rows}
-                      for title, rows in trackers.items()}
-            combined = [r for rows in trackers.values() for r in rows]
-            sheets['All Products'] = {'columns': HEADERS, 'rows': combined}
-            # Stable UI labels point to the two renamed authoritative tracker tabs.
-            sheets['Full Title'] = sheets[FULL]
-            sheets['Remaining Products'] = sheets[REMAINING]
+            return jsonify(production_snapshot(force=request.args.get('refresh') == '1', known_revision=request.args.get('revision')))
+        except RuntimeError as exc:
+            return jsonify(error=str(exc)), 502
+        except Exception as exc:
+            return jsonify(error=f'Could not read Google Sheets: {exc}'), 502
+
+    @app.get('/api/sync-reports')
+    def sync_reports():
+        report = store.latest_sync_report()
+        return jsonify(report={key: value for key, value in report.items() if not key.startswith('_')}, source='Local sync history')
+
+    @app.post('/api/desktop/check-connection')
+    def check_connection():
+        if not gate.acquire(blocking=False):
+            return jsonify(error='Wait for the current capture or sync to finish before testing the connection.'), 409
+        try:
+            recover_latest_preview(required=True)
+            result = production_snapshot(force=True)
+            if result.get('offline'):
+                return jsonify(error=result['sync_error']), 502
             previews = store.list()
-            return jsonify(preview_name=previews[0]['name'] if previews else None, sheets=sheets)
+            return jsonify(connected=True, orders=len(result['sheets']['Overview']['rows']), updated_at=result.get('updated_at'),
+                           recovered_previews=len(previews), next_preview=max((p['id'] for p in previews), default=0) + 1)
         except Exception as exc:
             return jsonify(error=str(exc)), 502
+        finally:
+            gate.release()
 
     @app.post('/api/extract')
     def extract():
-        if not gate.acquire(blocking=False):
-            return jsonify(error='An extraction is already running.'), 409
         with state_lock:
+            if state['running']:
+                return jsonify(error='A capture or queue sync is already running.'), 409
+            cancel_capture.clear()
             state.update(running=True, action='extract', stage='Starting fresh extraction', result=None,
-                         run_id=state['run_id'] + 1)
+                         cancel_requested=False, run_id=state['run_id'] + 1)
 
         def progress(result):
             with state_lock:
-                state.update(stage=result['stage'], result=result)
+                state.update(stage='Cancelling extraction…' if cancel_capture.is_set() else result['stage'], result=result)
 
         def work():
+            saved = None
+            operation_id = None
+            owns_gate = False
             try:
-                result = runner(on_progress=progress)
+                while not scheduler_stop.is_set():
+                    if cancel_capture.is_set():
+                        raise CaptureCancelled()
+                    if gate.acquire(timeout=1):
+                        owns_gate = True
+                        break
+                    with state_lock:
+                        state['stage'] = 'Waiting for the current Sheets update before extracting'
+                if not owns_gate:
+                    raise RuntimeError('Application stopped before extraction could start.')
+                operation_id = journal.begin('capture')
+                recover_latest_preview(required=True)
+                prior_ids = {item['id'] for item in store.list()}
+                with import_lock:
+                    result = runner(on_progress=progress)
+                if result.get('cancelled'):
+                    raise CaptureCancelled()
                 if result.get('error'):
                     raise RuntimeError(result['error'])
                 preview_id = result.get('preview_id')
-                if not preview_id:
-                    raise RuntimeError('Extraction did not save a preview.')
+                if preview_id is None or preview_id in prior_ids:
+                    raise RuntimeError('Extraction did not save a new preview; existing data was retained.')
+                saved = store.get(preview_id)
                 invalidate_snapshot()
-                frame, saved, _, _ = prepare_sync(preview_id)
-                worksheets = upload_sync(frame)
-                result.update(action='sync', google_sheet='success', worksheets=worksheets,
-                              pass_report=frame.attrs.get('pass_report'), error=None)
                 with state_lock:
-                    state.update(result=result, stage='Finished')
+                    state.update(stage='Finished', result=dict(result, action='extract', saved_locally=True, google_sheet='manual'))
+            except CaptureCancelled:
+                with state_lock:
+                    state.update(stage='Extraction cancelled', result={'cancelled': True, 'error': None,
+                        'saved_locally': bool(saved), 'preview_id': saved['id'] if saved else None,
+                        'preview_name': saved['name'] if saved else None})
             except Exception as exc:
                 app.logger.exception('Extraction failed')
                 with state_lock:
-                    state.update(stage='Failed', result={'error': str(exc)})
+                    state.update(stage='Capture saved; Sheets sync needs retry' if saved else 'Failed', result={'error': str(exc), 'google_sheet': 'failed',
+                                 'saved_locally': bool(saved), 'rows': len(saved['rows']) if saved else 0,
+                                 'preview_name': saved['name'] if saved else None,
+                                 'preview_id': saved['id'] if saved else None})
             finally:
                 invalidate_snapshot()
                 with state_lock:
+                    finish_operation(operation_id)
                     state['running'] = False
-                gate.release()
+                    if owns_gate:
+                        gate.release()
         threading.Thread(target=work, daemon=True).start()
+        return jsonify(accepted=True), 202
+
+    @app.post('/api/extract/cancel')
+    def cancel_extraction():
+        run_id = (request.get_json(silent=True) or {}).get('run_id')
+        with state_lock:
+            if not state['running'] or state['action'] != 'extract':
+                return jsonify(error='No queue extraction is running.'), 409
+            if run_id is not None and run_id != state['run_id']:
+                return jsonify(error='That extraction has already finished. Refresh the current operation.'), 409
+            cancel_capture.set()
+            state.update(cancel_requested=True, stage='Cancelling extraction…')
         return jsonify(accepted=True), 202
 
     @app.post('/api/sync')
@@ -608,6 +1212,8 @@ def create_app(root=None, runner=None, syncer=None, start_scheduler=False, time_
             raw_times = [raw_time] if raw_time else []
         elif isinstance(raw_times, str):
             raw_times = [raw_times]
+        if not isinstance(raw_times, list) or len(raw_times) > 48:
+            raise ValueError('Provide at most 48 scheduled times.')
 
         validated_times = []
         for t_str in raw_times:
@@ -623,13 +1229,20 @@ def create_app(root=None, runner=None, syncer=None, start_scheduler=False, time_
             validated_times = ['09:00']
         validated_times = sorted(list(dict.fromkeys(validated_times)))
 
+        raw_days = body.get('days', list(range(7)))
+        if (not isinstance(raw_days, list) or not raw_days or
+                any(type(day) is not int or day < 0 or day > 6 for day in raw_days)):
+            raise ValueError('Choose at least one day from Monday through Sunday.')
+        validated_days = sorted(set(raw_days))
+
         now = indian_clock.now()
         if enabled and now is None:
             return jsonify(error='Indian time is still synchronizing. Try saving the schedule again shortly.'), 503
         with schedule_lock:
             current = load_schedule()
-            changed = current['enabled'] != enabled or current.get('times') != validated_times
-            current.update(enabled=enabled, times=validated_times, time=validated_times[0])
+            changed = (current['enabled'] != enabled or current.get('times') != validated_times or
+                       current.get('days') != validated_days)
+            current.update(enabled=enabled, times=validated_times, time=validated_times[0], days=validated_days)
             if (changed or enabled) and now is not None:
                 already_triggered = current.get('triggered_today', []) if current.get('last_triggered_date') == now.date().isoformat() else []
                 current['last_triggered_date'] = now.date().isoformat()
@@ -639,47 +1252,214 @@ def create_app(root=None, runner=None, syncer=None, start_scheduler=False, time_
             schedule_tick()
         return jsonify(current)
 
+    @app.post('/api/sync-schedule/clear-history')
+    def clear_schedule_history():
+        kind = (request.get_json(silent=True) or {}).get('kind')
+        if kind not in ('attempt', 'success'):
+            raise ValueError('Choose attempt or success history to clear.')
+        with schedule_lock:
+            schedule = load_schedule()
+            schedule[f'cleared_{kind}_at'] = journal.now()
+            save_schedule(schedule)
+        return jsonify(cleared=kind)
+
     @app.get('/api/previews/<int:number>')
     def preview(number):
         return jsonify(store.get(number))
 
+    def reconcile_pending_previews(allow_empty=False):
+        if not store.unsynced_ids():
+            return {'mapping': {}}
+        from tracker_sync import archive_value_matches, records, sync_lock, text
+        from workspace_backup import save_safety_backup
+
+        with sync_lock(store.root):
+            book, _ = target_worksheet()
+            sheets = {sheet.title: sheet for sheet in book.worksheets()}
+            archive = sheets.get('Sheet1')
+            if archive is None:
+                if allow_empty:
+                    return {'mapping': {}}
+                raise ValueError('Google Sheets has no raw preview history to reconcile.')
+            cloud = {}
+            for row in records(archive.get_all_values(value_render_option='UNFORMATTED_VALUE')):
+                match = re.fullmatch(r'preview([1-9]\d*)', text(row.get('Preview')))
+                if match:
+                    cloud.setdefault(int(match[1]), []).append(row)
+            highest_cloud = max(cloud, default=0)
+            first_conflict = None
+            for number in store.unsynced_ids():
+                if number > highest_cloud:
+                    break
+                local = store.get(number)
+                remote = cloud.get(number)
+                if remote and not local['rows'] and len(remote) == 1 and not any(
+                        text(remote[0].get(column)) for column in local['columns']):
+                    remote = []  # A single blank archive row marks an empty capture.
+                if (remote is None or len(local['rows']) != len(remote) or any(
+                        not archive_value_matches(row.get(column, ''), saved.get(column, ''))
+                        for row, saved in zip(local['rows'], remote)
+                        for column in local['columns'])):
+                    first_conflict = number
+                    break
+            if first_conflict is None:
+                return {'mapping': {}, 'message': 'Pending captures already have unique cloud numbers.'}
+            backup = save_safety_backup(store, 'before-update')
+            mapping = store.rebase_unsynced(first_conflict, highest_cloud)
+        invalidate_snapshot()
+        return {'mapping': mapping, 'recovery_backup': backup.name,
+                    'message': 'Pending captures were given new numbers after the existing Google Sheets history.'}
+
+    @app.post('/api/previews/reconcile')
+    def reconcile_preview_numbers():
+        if not gate.acquire(blocking=False):
+            return jsonify(error='Wait for the current capture or sync to finish.'), 409
+        try:
+            return jsonify(**reconcile_pending_previews())
+        finally:
+            gate.release()
+
+    def preview_history_state():
+        return dict(previews=store.list(), pending_sync=store.pending_count(), **store.reset_status())
+
     @app.delete('/api/previews/<int:number>')
     def delete_preview(number):
-        store.delete(number)
-        invalidate_snapshot()
-        return jsonify(deleted=number)
+        if not gate.acquire(blocking=False):
+            return jsonify(error='Wait for extraction or sync to finish before deleting a preview.'), 409
+        try:
+            with queue_lock:
+                if queued_ids:
+                    return jsonify(error='Wait for queued syncs to finish before deleting a preview.'), 409
+            # Verify the ID before writing a backup, and fail closed if it cannot be saved.
+            store.get(number)
+            from workspace_backup import save_safety_backup
+            try:
+                backup = save_safety_backup(store, 'before-delete')
+            except OSError:
+                return jsonify(error='The recovery copy could not be saved. Check free disk space; the capture was not deleted.'), 503
+            with preview_recovery_lock:
+                store.delete(number)
+            invalidate_snapshot()
+            production_cache.invalidate()
+            if not store.list():
+                with state_lock:
+                    state.update(result=None, stage='Idle')
+            return jsonify(deleted=number, recovery_backup=backup.name, **preview_history_state())
+        finally:
+            gate.release()
+
+    @app.post('/api/previews/batch-delete')
+    def batch_delete_previews():
+        if not gate.acquire(blocking=False):
+            return jsonify(error='Wait for extraction or sync to finish before deleting previews.'), 409
+        try:
+            with queue_lock:
+                if queued_ids:
+                    return jsonify(error='Wait for queued syncs to finish before deleting previews.'), 409
+            payload = request.get_json(silent=True) or {}
+            raw_ids = payload.get('ids', [])
+            ids = {int(i) for i in raw_ids if str(i).isdecimal()}
+            if not ids:
+                return jsonify(error='No preview IDs provided for deletion.'), 400
+
+            from workspace_backup import save_safety_backup
+            try:
+                backup = save_safety_backup(store, 'before-delete')
+            except OSError:
+                return jsonify(error='The recovery copy could not be saved. Check free disk space; captures were not deleted.'), 503
+
+            with preview_recovery_lock:
+                deleted_ids = store.delete_many(ids)
+
+            invalidate_snapshot()
+            production_cache.invalidate()
+            if not store.list():
+                with state_lock:
+                    state.update(result=None, stage='Idle')
+            return jsonify(deleted=deleted_ids, recovery_backup=backup.name, **preview_history_state())
+        finally:
+            gate.release()
+
+    @app.post('/api/previews/reset')
+    @app.post('/api/previews/reset/undo')
+    def reset_capture_history():
+        undo = request.path.endswith('/undo')
+        if not gate.acquire(blocking=False):
+            return jsonify(error='Wait for extraction or sync to finish before changing capture history.'), 409
+        try:
+            with queue_lock:
+                if queued_ids:
+                    return jsonify(error='Wait for queued syncs to finish before changing capture history.'), 409
+            with preview_recovery_lock:
+                try:
+                    if undo:
+                        count = store.undo_preview_reset()
+                        result = {'restored': count}
+                    else:
+                        from workspace_backup import save_safety_backup
+                        backup = save_safety_backup(store, 'before-delete')
+                        count = store.reset_previews()
+                        result = {'deleted': count, 'recovery_backup': backup.name}
+                except ValueError as exc:
+                    return jsonify(error=str(exc)), 409
+                except OSError:
+                    return jsonify(error='The recovery copy could not be saved. Capture history was kept.'), 503
+                invalidate_snapshot()
+            with state_lock:
+                state.update(result=None, stage='Idle')
+            production_cache.invalidate()
+            return jsonify(**result, **preview_history_state())
+        finally:
+            gate.release()
 
     @app.post('/api/import')
     def import_file():
         upload = request.files.get('file')
         if not upload or not upload.filename:
             raise ValueError('Select a CSV or XLSX file.')
-        suffix = Path(upload.filename).suffix.lower()
+        if not import_lock.acquire(blocking=False):
+            return jsonify(error='Another capture or import is using the local workspace. Try again when it finishes.'), 409
+        owns_gate = gate.acquire(blocking=False)
+        if not owns_gate:
+            with state_lock:
+                can_queue = state['running'] and state['action'] == 'sync' and not maintenance.is_set()
+            if not can_queue:
+                import_lock.release()
+                return jsonify(error='Wait for the current capture or maintenance operation before importing.'), 409
         try:
-            if suffix == '.csv':
-                frame = pd.read_csv(upload, dtype=str, keep_default_na=False, encoding='utf-8-sig')
-            elif suffix == '.xlsx':
-                frame = pd.read_excel(upload, dtype=str, keep_default_na=False, engine='openpyxl')
-            else:
-                raise ValueError('Only CSV and XLSX files are supported.')
-        except Exception as exc:
-            raise ValueError('Cannot read this file. Use a valid UTF-8 CSV or XLSX workbook with headers.') from exc
-        saved = store.save(frame, source=Path(upload.filename).name)
-        invalidate_snapshot()
-        begin_sync('import', saved['id'])
-        return jsonify(saved), 201
+            suffix = Path(upload.filename).suffix.lower()
+            try:
+                if suffix == '.csv':
+                    frame = pd.read_csv(upload, dtype=str, keep_default_na=False, encoding='utf-8-sig')
+                elif suffix == '.xlsx':
+                    frame = pd.read_excel(upload, dtype=str, keep_default_na=False, engine='openpyxl')
+                else:
+                    raise ValueError('Only CSV and XLSX files are supported.')
+            except Exception as exc:
+                raise ValueError('Cannot read this file. Use a valid UTF-8 CSV or XLSX workbook with headers.') from exc
+            can_sync = not desktop_mode or bool(SPREADSHEET_ID and os.environ.get('GOOGLE_SERVICE_ACCOUNT_JSON'))
+            if can_sync:
+                recover_latest_preview(required=True)
+            saved = store.save(frame, source=Path(upload.filename).name)
+            invalidate_snapshot()
+        finally:
+            if owns_gate:
+                gate.release()
+            import_lock.release()
+        if can_sync:
+            begin_sync('import', saved['id'])
+        return jsonify(dict(saved, auto_sync=can_sync)), 201
 
     @app.get('/api/previews/<int:number>/download/<kind>')
     def download(number, kind):
         preview = store.get(number)
         if kind not in ('csv', 'xlsx'):
             raise ValueError('Unsupported download format.')
+        frame = pd.DataFrame(preview['rows'], columns=preview['columns']).fillna('')
         if kind == 'xlsx':
-            return export_google_sheets()
-        else:
-            frame = apply_status_rules(pd.DataFrame(preview['rows'], columns=preview['columns']), [])
-            stream = BytesIO(frame.to_csv(index=False).encode('utf-8-sig'))
-            return send_file(stream, as_attachment=True, download_name=f'preview{number}.csv')
+            return send_file(workbook(frame, 'DataTraceQueue'), as_attachment=True, download_name=f'preview{number}.xlsx')
+        stream = BytesIO(frame.to_csv(index=False).encode('utf-8-sig'))
+        return send_file(stream, as_attachment=True, download_name=f'preview{number}.csv')
 
     @app.get('/api/export/google-sheets')
     def export_google_sheets():
@@ -687,38 +1467,55 @@ def create_app(root=None, runner=None, syncer=None, start_scheduler=False, time_
             return jsonify(error='Wait for the current extraction or sync to finish before exporting.'), 409
         try:
             book, _ = target_worksheet()
-            stream = BytesIO()
-            preview_name = 'GoogleSheets'
+            worksheets = [sheet for sheet in book.worksheets() if not sheet.title.startswith('__DataTrace_')]
+            from tracker_sync import OLD_FULL, OLD_REMAINING
             short_names = {FULL: 'Full Title', REMAINING: 'Remaining Products'}
-            worksheets = book.worksheets()
-            too_long = [w.title for w in worksheets if len(w.title) > 31]
-            if too_long and request.args.get('short_names') != 'true':
-                return jsonify(error='Excel limits tab names to 31 characters. Confirm exporting the tracker tabs as Full Title and Remaining Products.',
-                               requires_short_names=True, proposed_names=short_names), 409
-            from openpyxl.styles import PatternFill, Font
-            from tracker_formatting import foreground
-            from datatrace_sync import status_color
+            if FULL == OLD_FULL.removesuffix('_-_September_2026'):
+                short_names[OLD_FULL] = 'Full Title'
+            if REMAINING == OLD_REMAINING.removesuffix('_-_September_2026'):
+                short_names[OLD_REMAINING] = 'Remaining Products'
+            titles = {sheet.title for sheet in worksheets}
+            from monthly_production import tab_identity
+            has_full = FULL in titles or (OLD_FULL in short_names and OLD_FULL in titles)
+            has_remaining = REMAINING in titles or (OLD_REMAINING in short_names and OLD_REMAINING in titles)
+            sources = tracker_sources(book) if (has_full and has_remaining) or any(tab_identity(t) for t in titles) else []
+            proposed, used = {}, set()
+            for sheet in sorted(worksheets, key=lambda sheet: sheet.title not in short_names):
+                base = short_names.get(sheet.title, re.sub(r'[\\/*?:\[\]]', '_', sheet.title))[:31] or 'Sheet'
+                name, index = base, 2
+                while name.casefold() in used:
+                    suffix = f' ({index})'
+                    name = base[:31-len(suffix)] + suffix
+                    index += 1
+                used.add(name.casefold())
+                proposed[sheet.title] = name
+            renamed = {title: name for title, name in proposed.items() if title != name}
+            if renamed and request.args.get('short_names') != 'true':
+                return jsonify(error='Excel tab names have a 31-character limit. Confirm the proposed names for the exported copy.', requires_short_names=True, proposed_names=renamed), 409
+            refreshed = production_export_frames(book, store, sources=sources)
+            stream = BytesIO()
             with pd.ExcelWriter(stream, engine='openpyxl') as writer:
                 for sheet in worksheets:
-                    values = sheet.get_all_values()
-                    title = short_names.get(sheet.title, sheet.title)
-                    if len(title) > 31:
-                        raise ValueError(f'Choose a shorter export name for {sheet.title}.')
-                    pd.DataFrame(values).to_excel(writer, sheet_name=title, index=False, header=False)
-                    ws = writer.sheets[title]
+                    values = refreshed.get(sheet.title)
+                    if values is None:
+                        values = sheet.get_all_values()
+                    name = proposed[sheet.title]
+                    pd.DataFrame(values).to_excel(writer, sheet_name=name, index=False, header=False)
+                    ws = writer.sheets[name]
                     for row in ws:
                         for cell in row:
                             if isinstance(cell.value, str):
                                 cell.data_type = 's'
-                    if values and 'Status' in values[0]:
-                        status_index = values[0].index('Status')
-                        for cells in ws.iter_rows(min_row=2):
-                            color = status_color(cells[status_index].value)
-                            for cell in cells:
-                                fill = color
-                                cell.fill = PatternFill('solid', fgColor=fill.lstrip('#'))
-                                cell.font = Font(color=foreground(fill).lstrip('#'))
                     ws.freeze_panes = 'A2'
+                    if sheet.title in TRACKERS or tab_identity(sheet.title) or sheet.title in (OLD_FULL, OLD_REMAINING):
+                        from openpyxl.styles import Font, PatternFill, Border, Side
+                        border = Border(**{side: Side(style='thin', color='000000') for side in ('left', 'right', 'top', 'bottom')})
+                        for cells in ws:
+                            for cell in cells:
+                                cell.font = Font(color='000000', bold=cell.row == 1)
+                                cell.fill = PatternFill('solid', fgColor='FFFFFF')
+                                cell.border = border
+                    color_export_sheet(ws, values)
             stream.seek(0)
             return send_file(stream, as_attachment=True, download_name='Production_data.xlsx')
         except Exception as exc:
@@ -730,7 +1527,7 @@ def create_app(root=None, runner=None, syncer=None, start_scheduler=False, time_
     def comparison():
         body = request.get_json()
         previous, latest = store.get(int(body['previous'])), store.get(int(body['latest']))
-        result = compare(previous, latest, ['Order Number'], body.get('ignore'))
+        result = compare(previous, latest, ['Order Number'], body.get('ignore'), history=store.history())
         if body.get('download'):
             frame = pd.DataFrame(result['rows'], columns=result['columns'])
             frame['Previous Preview'] = previous['name']
@@ -742,53 +1539,80 @@ def create_app(root=None, runner=None, syncer=None, start_scheduler=False, time_
     @app.get('/')
     @app.get('/<path:path>')
     def frontend(path='index.html'):
-        return send_from_directory(BASE_DIR / 'frontend' / 'dist', path)
+        return send_from_directory(ASSET_DIR / 'frontend' / 'dist', path)
+
+    from monthly_api import register_monthly_routes
+    auto_monthly_preview = register_monthly_routes(app, store, gate, maintenance, production_cache, production_snapshot, lambda: target_worksheet())
+    from report_workspace import register_report_routes
+    app.extensions['publish_active_reports'] = register_report_routes(
+        app, report_workspace, gate, production_snapshot, lambda: target_worksheet(), production_cache.invalidate)
+    app.extensions['monthly_tick'] = auto_monthly_preview
+
+    def resume_connection_sync():
+        """Retry the oldest capture after its authentication/network failure clears."""
+        nonlocal connection_retry_after
+        if clock.monotonic() < connection_retry_after:
+            return False
+        unsynced = store.unsynced_ids()
+        if not unsynced:
+            return False
+        failures = {row['preview_id']: row['error'] for row in store.failed_syncs()}
+        error = failures.get(unsynced[0], '').casefold()
+        if not any(message in error for message in (
+                'google sheets authentication failed', 'google sheets connection failed',
+                'google sheets access failed (transporterror)',
+                'set google_service_account_json to a valid service account json',
+                'open connections & settings to add your google sheet and service-account key')):
+            return False
+        if not gate.acquire(blocking=False):
+            return False
+        try:
+            target_worksheet()
+        except Exception:
+            # A rejected key or unavailable network must not cause a write loop.
+            connection_retry_after = clock.monotonic() + 300
+            return False
+        finally:
+            gate.release()
+        connection_retry_after = float('-inf')
+        return begin_sync('retry', unsynced[0])
+
+    app.extensions['resume_connection_sync'] = resume_connection_sync
 
     if start_scheduler:
         def schedule_loop():
-            try:
-                sync_trackers()
-            except Exception as exc:
-                app.logger.exception('Default tracker initialization failed')
-                with state_lock:
-                    state.update(stage='Google Sheets setup needs attention', result={'error': str(exc)})
-            while True:
+            while not scheduler_stop.wait(15):
                 try:
-                    # Saved but unsynced previews survive restarts and wait for the lock.
-                    for preview_id in store.pending_syncs():
-                        frame, _, _, _ = prepare_sync(preview_id)
-                        with gate:
-                            with state_lock:
-                                state.update(running=True, action='sync', stage=f'Syncing preview{preview_id}', run_id=state['run_id'] + 1)
-                            try:
-                                worksheets = upload_sync(frame)
-                                with state_lock:
-                                    state.update(stage='Finished', result={'action': 'sync', 'google_sheet': 'success',
-                                        'preview_name': frame.attrs['preview_name'], 'rows': len(frame),
-                                        'worksheets': worksheets, 'pass_report': frame.attrs.get('pass_report')})
-                            finally:
-                                with state_lock:
-                                    state['running'] = False
-                    schedule_tick()
-                except Exception as exc:
-                    app.logger.exception('Automatic sync failed; preview retained')
-                    with state_lock:
-                        state.update(stage='Automatic sync needs attention', result={'error': str(exc)})
-                clock.sleep(15)
+                    if desktop_mode and not (SPREADSHEET_ID and os.environ.get('GOOGLE_SERVICE_ACCOUNT_JSON')):
+                        continue
+                    recover_latest_preview()
+                    app.extensions['refresh_imported_reports']()
+                    auto_monthly_preview()
+                    if not schedule_tick():
+                        pending = store.pending_syncs()
+                        if pending:
+                            begin_sync('retry', pending[0])
+                        else:
+                            resume_connection_sync()
+                except Exception:
+                    app.logger.exception('Scheduled capture could not start')
         threading.Thread(target=schedule_loop, daemon=True).start()
 
     return app
 
 
 def main():
-    import os
+    import logging
+    import webbrowser
     parser = argparse.ArgumentParser()
     default_host = os.environ.get('HOST', '0.0.0.0' if (os.environ.get('RENDER') or os.environ.get('PORT')) else '127.0.0.1')
     default_port = int(os.environ.get('PORT', 8510))
     parser.add_argument('--host', type=str, default=default_host)
     parser.add_argument('--port', type=int, default=default_port)
+    parser.add_argument('--open-browser', action='store_true',
+                        help='Open the workspace in the system browser after the server starts.')
     args = parser.parse_args()
-    from waitress import serve
+    from waitress import create_server
     host = args.host
     port = args.port
     if host == '127.0.0.1':
@@ -801,8 +1625,30 @@ def main():
                     port += 1
         else:
             raise RuntimeError('No free dashboard port. Choose another port with --port.')
-    print(f'DataTrace Workspace: http://{host}:{port}', flush=True)
-    serve(create_app(start_scheduler=True), host=host, port=port, threads=8)
+    logging.basicConfig()
+    app = create_app(start_scheduler=True)
+    try:
+        server = create_server(app, host=host, port=port, threads=8)
+    except Exception:
+        app.extensions['stop_scheduler'].set()
+        raise
+    try:
+        browser_host = '127.0.0.1' if host == '0.0.0.0' else host
+        if ':' in browser_host:
+            browser_host = f'[{browser_host}]'
+        url = f'http://{browser_host}:{server.effective_port}'
+        print(f'DataTrace Workspace: {url}', flush=True)
+        if args.open_browser:
+            try:
+                opened = webbrowser.open(url, new=2)
+            except (OSError, webbrowser.Error):
+                opened = False
+            if not opened:
+                print('Open the workspace URL above in Microsoft Edge or Google Chrome.', flush=True)
+        server.run()
+    finally:
+        app.extensions['stop_scheduler'].set()
+        server.close()
 
 
 if __name__ == '__main__':

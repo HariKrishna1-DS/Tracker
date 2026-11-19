@@ -20,13 +20,13 @@ test('slow state polling stays serial and sync posts without a state preflight',
     }else if(path==='/api/previews/28'){
       await route.fulfill({json:preview});
     }else if(path==='/api/live-sheets'){
-      await route.fulfill({json:{preview_name:'preview28',sheets:{
+      await route.fulfill({json:{mode:'tracker',preview_name:'preview28',sheets:{
         'All Products':preview,'Full Title':preview,'Remaining Products':{columns:preview.columns,rows:[]},
         'Status Report':{columns:['Status','Orders'],rows:[{Status:'Available',Orders:1}]}}}});
     }else await route.fulfill({json:{}});
   });
-  await page.goto(process.env.DASHBOARD_TEST_URL || 'http://127.0.0.1:8525');
-  const sync=page.getByRole('button',{name:'Sync preview28 to Sheets',exact:true});
+  await page.goto(process.env.DASHBOARD_TEST_URL || '/');
+  const sync=page.getByRole('button',{name:'Sync to Sheets',exact:true});
   await expect(sync).toBeEnabled({timeout:15000});
   await page.waitForTimeout(6500);
   expect(maxActive).toBe(1);

@@ -26,8 +26,9 @@ class Sheet:
         self.row_count, self.col_count = 100, 30
         self.conditional_formats = []
 
-    def get_all_values(self):
-        values = [[str(v) if v is not None else '' for v in r] for r in self.values]
+    def get_all_values(self, value_render_option=None):
+        values = [[v if value_render_option == 'UNFORMATTED_VALUE' else str(v)
+                   if v is not None else '' for v in r] for r in self.values]
         for row in values:
             while row and row[-1] == '':
                 row.pop()
@@ -117,15 +118,15 @@ class TrackerRulesTests(unittest.TestCase):
     def test_case_trim_match_manual_columns_and_no_invented_completion(self):
         for task in ('TypingModule', 'SearchFix', 'CRSP2', 'N/A'):
             merged, report = self.merge([order('AbC')], [{'Order Number': ' abc ', 'Task Name': task, 'Task Status': 'Completed', 'Searcher': 'Overwrite'}])
-            self.assertEqual(merged[FULL][0]['Status'], 'In Progress')
+            self.assertEqual(merged[FULL][0]['Status'], 'SearchFix' if task in ('SearchFix', 'CRSP2') else 'In Progress')
             self.assertEqual(merged[FULL][0]['Searcher'], 'Manual searcher')
             self.assertEqual(merged[FULL][0]['Review/QC'], '=A1')
             self.assertEqual(report['added'], 0)
 
-    def test_unchanged_drivers_preserve_manually_completed_status(self):
+    def test_active_capture_rechecks_a_saved_completion_without_out_time(self):
         raw = {'Order Number': 'A', 'Task Name': 'Search', 'Task Status': 'Available'}
         result, _ = self.merge([order('A', 'Completed and Delivered')], [raw], [raw])
-        self.assertEqual(result[FULL][0]['Status'], 'Completed and Delivered')
+        self.assertEqual(result[FULL][0]['Status'], 'Search In Progress')
 
     def test_changed_drivers_apply_mapping(self):
         old = {'Order Number': 'A', 'Task Name': 'Search', 'Task Status': 'In Progress'}
@@ -162,6 +163,25 @@ class TrackerRulesTests(unittest.TestCase):
         self.assertEqual(result['counts']['modified'], 1)
         self.assertEqual(result['counts']['removed'], 0)
 
+    def test_recovered_sheet_booleans_are_not_false_changes(self):
+        a = {'name': 'preview1', 'columns': ['Order Number', 'Is Available', 'WorkflowSuspended'],
+             'rows': [{'Order Number': '001', 'Is Available': 'TRUE', 'WorkflowSuspended': 'FALSE'}]}
+        b = {'name': 'preview2', 'columns': a['columns'],
+             'rows': [{'Order Number': '001', 'Is Available': True, 'WorkflowSuspended': False}]}
+        self.assertEqual(compare(a, b)['counts']['unchanged'], 1)
+        b['rows'][0]['WorkflowSuspended'] = True
+        result = compare(a, b)
+        self.assertEqual(result['counts']['modified'], 1)
+        self.assertEqual([r['Column'] for r in result['rows']], ['WorkflowSuspended'])
+        b['rows'][0]['Order Number'] = '1'
+        result = compare(a, b)
+        self.assertEqual((result['counts']['added'], result['counts']['removed']), (1, 1))
+
+    def test_boolean_recovery_comparison_without_unique_keys(self):
+        a = {'name': 'preview1', 'columns': ['Is Available'], 'rows': [{'Is Available': 'FALSE'}]}
+        b = {'name': 'preview2', 'columns': a['columns'], 'rows': [{'Is Available': False}]}
+        self.assertEqual(compare(a, b)['counts']['unchanged'], 1)
+
     def test_remote_database_environment_cannot_enable_access(self):
         with tempfile.TemporaryDirectory() as folder, patch.dict('os.environ', {'DATABASE_URL': 'postgresql://invalid'}):
             store = PreviewStore(folder)
@@ -196,12 +216,13 @@ class SheetTransactionTests(unittest.TestCase):
         b = self.frame(2, [{'Order Number': 'B', 'Product': 'Full Title', 'Task Status': 'In Progress'}])
         sync_trackers(b, book=self.book)
         rows = records(self.book.worksheet(FULL).get_all_values())
-        self.assertEqual([r['Order Number'] for r in rows], ['BASE', 'A', 'B'])
+        self.assertEqual([r['Order Number'] for r in rows], ['A', 'B', 'BASE'])  # Missing arrivals tie-break by order.
         self.assertEqual(self.book.worksheet('Sheet1').get_all_values()[:len(old)], old)
         self.assertFalse(any(s.title.startswith('preview') for s in self.book.worksheets()))
         self.assertFalse(any(s.title in ('Preview History', 'Default conflicts', 'Changes', 'Ambiguous - Needs review')
                              for s in self.book.worksheets()))
-        self.assertEqual(len(records(self.book.worksheet('All Products').get_all_values())), 2)
+        self.assertEqual([row['Order Number'] for row in records(self.book.worksheet('All Products').get_all_values())], ['B'])
+        self.assertEqual(len(records(self.book.worksheet('Sheet1').get_all_values())), 2)
         self.assertEqual(b.attrs['pass_report']['not_in_latest'], ['A'])
 
     def test_committed_preview_is_a_noop(self):
@@ -209,7 +230,34 @@ class SheetTransactionTests(unittest.TestCase):
         sync_trackers(frame, book=self.book)
         count = len(self.book.batches)
         sync_trackers(frame, book=self.book)
+        self.assertEqual(len(self.book.batches), count)  # Unchanged formatting no longer consumes a write.
+        self.assertFalse(any('updateCells' in r for r in self.book.batches[-1]['requests']))
+
+    def test_numeric_archive_round_trip_retry_does_not_duplicate(self):
+        frame = self.frame(1, [{'Order Number': '001', 'Product': 'Full Title',
+                               'Queue Age Hours': 240.0, 'WorkflowSuspended': False}])
+        sync_trackers(frame, book=self.book)
+        archive = self.book.worksheet('Sheet1')
+        archive.values[1][archive.values[0].index('Queue Age Hours')] = 240
+        count = len(self.book.batches)
+        sync_trackers(frame, book=self.book)
         self.assertEqual(len(self.book.batches), count)
+        self.assertFalse(any('updateCells' in r for r in self.book.batches[-1]['requests']))
+        self.assertEqual(len(records(archive.get_all_values())), 1)
+
+    def test_numeric_change_or_text_identifier_change_still_blocks_retry(self):
+        frame = self.frame(1, [{'Order Number': '001', 'Product': 'Full Title',
+                               'Queue Age Hours': 240.125}])
+        sync_trackers(frame, book=self.book)
+        archive = self.book.worksheet('Sheet1')
+        age = archive.values[0].index('Queue Age Hours')
+        archive.values[1][age] = 240.126
+        with self.assertRaisesRegex(ValueError, 'different saved snapshot'):
+            sync_trackers(frame, book=self.book)
+        archive.values[1][age] = 240.125
+        archive.values[1][archive.values[0].index('Order Number')] = '1'
+        with self.assertRaisesRegex(ValueError, 'different saved snapshot'):
+            sync_trackers(frame, book=self.book)
 
     def test_retry_after_lost_reply_does_not_duplicate_appends(self):
         self.book.fail_after_commit = True
@@ -222,6 +270,22 @@ class SheetTransactionTests(unittest.TestCase):
         sync_trackers(self.frame(2, [{'Order Number': 'A', 'Product': 'Full Title'}]), book=self.book)
         with self.assertRaisesRegex(ValueError, 'older preview'):
             sync_trackers(self.frame(1, [{'Order Number': 'B', 'Product': 'Full Title'}]), book=self.book)
+
+    def test_restarted_local_numbers_keep_cloud_history_and_retry_safely(self):
+        store = PreviewStore(self.folder.name)
+        store.restore(2, ['Order Number', 'Product'], [{'Order Number': 'A', 'Product': 'Full Title'}])
+        sync_trackers(self.frame(2, [{'Order Number': 'A', 'Product': 'Full Title'}]), book=self.book)
+        store.delete(2)
+        rows = [{'Order Number': 'B', 'Product': 'Full Title'}]
+        saved = store.save(pd.DataFrame(rows))
+        self.assertEqual(saved['name'], 'preview1')
+        frame = self.frame(saved['id'], rows)
+        sync_trackers(frame, book=self.book)
+        sync_trackers(frame, book=self.book)
+        archive = records(self.book.worksheet('Sheet1').get_all_values())
+        self.assertEqual([(row['Preview'], row['Order Number']) for row in archive],
+                         [('preview2', 'A'), ('preview3', 'B')])
+        self.assertEqual(frame.attrs['pass_report']['preview_name'], 'preview1')
 
     def test_manual_formula_never_written_when_syncing_existing_order(self):
         frame = self.frame(1, [{'Order Number': 'BASE', 'Product': 'Full Title'}])
@@ -252,7 +316,7 @@ class AutomaticApiTests(unittest.TestCase):
             time.sleep(.02)
         self.fail('Automatic sync did not complete')
 
-    def test_import_syncs_without_click_and_waits_behind_another_sync(self):
+    def test_imports_remain_local_until_manual_sync_drains_them_in_order(self):
         from io import BytesIO
         from server import create_app
         entered, release = threading.Event(), threading.Event()
@@ -267,14 +331,20 @@ class AutomaticApiTests(unittest.TestCase):
         for name in ('A', 'B'):
             response = client.post('/api/import', data={'file': (BytesIO(f'Order Number,Product\n{name},Full Title\n'.encode()), 'queue.csv')})
             self.assertEqual(response.status_code, 201)
-            if name == 'A':
-                self.assertTrue(entered.wait(5))
+            self.assertEqual(calls, [])
         release.set()
+        client.post('/api/sheet-sync', json={'enabled': True})
+        self.assertEqual(client.post('/api/sync', json={'preview': client.get('/api/state').json['previews'][0]['id']}).status_code, 202)
         self.wait_synced(2)
+        # A sync receipt precedes the final journal write; wait before cleanup.
+        deadline = time.monotonic() + 5
+        while client.get('/api/health').json['running'] and time.monotonic() < deadline:
+            time.sleep(.01)
+        self.assertFalse(client.get('/api/health').json['running'])
         self.assertEqual(calls, [1, 2])
         self.assertEqual(len(self.store.list()), 2)
 
-    def test_manual_extraction_also_syncs_automatically(self):
+    def test_manual_extraction_waits_for_explicit_sheet_sync(self):
         from server import create_app
         calls = []
         def runner(on_progress):
@@ -282,7 +352,18 @@ class AutomaticApiTests(unittest.TestCase):
             return {'preview_id': preview['id'], 'preview_name': preview['name'], 'error': None}
         client = create_app(root=self.root, runner=runner, syncer=lambda frame: calls.append(frame.attrs['preview_id']) or [FULL]).test_client()
         self.assertEqual(client.post('/api/extract').status_code, 202)
+        for _ in range(400):
+            if not client.get('/api/health').json['running']: break
+            time.sleep(.01)
+        self.assertEqual(calls, [])
+        client.post('/api/sheet-sync', json={'enabled': True})
+        self.assertEqual(client.post('/api/sync', json={'preview': client.get('/api/state').json['previews'][0]['id']}).status_code, 202)
         self.wait_synced(1)
+        for _ in range(400):
+            if not client.get('/api/health').json['running']:
+                break
+            time.sleep(.01)
+        self.assertFalse(client.get('/api/health').json['running'])
         self.assertEqual(calls, [1])
 
     def test_live_sheet_failure_is_not_replaced_by_preview_totals(self):
