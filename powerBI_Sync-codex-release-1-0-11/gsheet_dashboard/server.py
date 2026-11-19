@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 import json
 import os
 import re
+import secrets
 import socket
 import hmac
 from io import BytesIO
@@ -25,7 +26,7 @@ from sync_config import BASE_DIR, ASSET_DIR, SPREADSHEET_ID, TARGET_GSHEET_URL, 
 from production_cache import ProductionCache
 from operation_journal import OperationJournal
 from request_metrics import RequestMetrics
-from tracker_sync import read_tracker_rows, read_preview_history, tracker_sources, TRACKERS, FULL, REMAINING, HEADERS, sheet_reports, read_pass_report
+from tracker_sync import read_tracker_rows, read_preview_history, tracker_sources, TRACKERS, FULL, REMAINING, HEADERS, sheet_reports, read_pass_report, received_at
 from indian_clock import IndianClock
 from sla_comments import sla_key, sla_status
 
@@ -137,6 +138,22 @@ def create_app(root=None, runner=None, syncer=None, start_scheduler=False, time_
     report_workspace = ReportWorkspace(store)
     journal = OperationJournal(store)
     cancel_capture = threading.Event()
+    sheet_sync_enabled = False
+
+    @app.route('/api/sheet-sync', methods=['GET', 'POST'])
+    def sheet_sync_setting():
+        nonlocal sheet_sync_enabled
+        from flask import request, jsonify
+        if request.method == 'POST':
+            sheet_sync_enabled = (request.get_json(silent=True) or {}).get('enabled') is True
+        return jsonify(enabled=sheet_sync_enabled)
+
+    @app.before_request
+    def enforce_manual_sheet_sync():
+        from flask import request, jsonify
+        if request.method == 'POST' and request.path in ('/api/sync', '/api/report-publish') and not sheet_sync_enabled:
+            return jsonify(error='Turn Sheet_sync On before manually syncing.'), 409
+
     runner = runner or (lambda on_progress: run_sync(on_progress=on_progress, auto_sync=False, cancel_event=cancel_capture))
     syncer = syncer or sync_workbook
     indian_clock = time_source or IndianClock()
@@ -399,13 +416,11 @@ def create_app(root=None, runner=None, syncer=None, start_scheduler=False, time_
             if not required and clock.monotonic() - recovery_checked < 60:
                 return
             recovery_checked = clock.monotonic()
-            if store.list():
+            if store.list() or not store.auto_recover():
                 return
             try:
-                book, primary = target_worksheet()
-                for preview in read_preview_history(book):
-                    store.restore(preview['id'], preview['columns'], preview['rows'], preview['source'], created=preview['created'])
-                    store.mark_synced(preview['id'], {'recovered': True})
+                book, _ = target_worksheet()
+                store.recover_cloud_previews(read_preview_history(book))
                 invalidate_snapshot()
             except Exception as exc:
                 app.logger.exception('Could not recover latest preview from Google Sheets')
@@ -509,6 +524,8 @@ def create_app(root=None, runner=None, syncer=None, start_scheduler=False, time_
         return frame, selected_preview, completed_orders, previous_id
 
     def begin_sync(trigger='manual', preview_id=None, previous_id=None, keys=None, ignore=None, remaining_products=None):
+        if trigger != 'manual' or not sheet_sync_enabled:
+            return False
         nonlocal worker_active
         preview_id = int(preview_id) if preview_id is not None else None
 
@@ -652,20 +669,8 @@ def create_app(root=None, runner=None, syncer=None, start_scheduler=False, time_
                     raise RuntimeError('Extraction did not save a new preview; Google Sheets were not changed.')
                 saved_preview = store.get(preview_id)
                 invalidate_snapshot()
-                frame, preview, completed, previous_id = prepare_sync(preview_id)
                 with state_lock:
-                    if cancel_capture.is_set():
-                        raise CaptureCancelled()
-                    state.update(action='sync', stage=f"Syncing {preview['name']} to Google Sheets")
-                drain_earlier_previews(frame.attrs['preview_id'])
-                worksheets = upload_sync(frame)
-                with state_lock:
-                    state.update(stage='Finished', result={
-                        'action': 'sync', 'trigger': 'schedule', 'error': None,
-                        'google_sheet': 'success', 'preview_id': preview['id'],
-                        'preview_name': preview['name'], 'rows': len(frame),
-                        'worksheets': worksheets, 'pass_report': frame.attrs.get('pass_report'), 'completed_orders': len(completed),
-                        'previous_id': previous_id})
+                    state.update(stage='Finished', result=dict(result, action='extract', saved_locally=True, google_sheet='manual'))
             except CaptureCancelled:
                 with state_lock:
                     state.update(stage='Extraction cancelled', result={'cancelled': True, 'error': None,
@@ -763,7 +768,7 @@ def create_app(root=None, runner=None, syncer=None, start_scheduler=False, time_
         return jsonify(previews=previews, job=job, schedule=schedule, clock=indian_clock.snapshot(), failed_syncs=store.failed_syncs(), sheet_url=TARGET_GSHEET_URL,
                        remaining_products=remaining_products, report_workspace=report_workspace.public(),
                        daily_completed_ids=daily_completed_ids,
-                       pending_sync=store.pending_count(),
+                       pending_sync=store.pending_count(), **store.reset_status(),
                        capabilities={'status_rules': True, 'automatic_statuses': True, 'desktop': desktop_mode,
                                      'google_configured': bool(SPREADSHEET_ID and os.environ.get('GOOGLE_SERVICE_ACCOUNT_JSON'))})
 
@@ -814,16 +819,64 @@ def create_app(root=None, runner=None, syncer=None, start_scheduler=False, time_
     def get_monthly_orders():
         try:
             snapshot = production_snapshot()
-            return jsonify(rows=snapshot['reports']['monthly'], sla_error=None,
+            received_column = 'Source received date'
+            months = []
+            for month in snapshot['reports']['monthly']:
+                rows = []
+                for row in month['rows']:
+                    received = received_at(row)
+                    rows.append({**row, received_column: received.date().isoformat() if received else ''})
+                columns = list(dict.fromkeys([received_column, *month['columns']]))
+                months.append(dict(month, rows=rows, columns=columns))
+            return jsonify(rows=months, sla_error=None,
                            **{key: snapshot.get(key) for key in ('source', 'mode', 'statuses', 'offline', 'updated_at', 'pending_sync', 'latest_capture_at', 'latest_synced_capture_at')})
         except Exception as exc:
             return jsonify(error=f'Could not read Google Sheets monthly orders: {exc}'), 502
 
+    def update_imported_sla(selection, status):
+        from order_details import edit_events, persist_edit
+        from report_workspace import imported_snapshot
+        from tracker_sync import key, sync_lock
+        from workspace_backup import save_safety_backup
+
+        with sync_lock(store.root), report_workspace.lock:
+            settings = report_workspace.read()
+            imported = settings.get('imported')
+            if settings['mode'] != 'excel' or not imported:
+                return jsonify(error='The imported report changed. Refresh the report before editing.'), 409
+            current = {(row['_record_key'], *sla_key(row)): row['Free Site']
+                       for month in imported_snapshot(imported)['reports']['monthly']
+                       for row in month['sla_rows']}
+            for selected, expected in selection.items():
+                if current.get(selected) not in (expected, status):
+                    return jsonify(error='A selected order or SLA status changed. Refresh the report and try again.'), 409
+
+            events = []
+            rows = []
+            for row in imported['rows']:
+                identity = (key(row), *sla_key(row))
+                if identity in selection and current[identity] != status:
+                    updated = dict(row, **{'Free Site': status})
+                    received = received_at(row)
+                    events.extend(edit_events(row, updated, {'Free Site': status}, 'excel',
+                                              received.date().isoformat() if received else 'Undated',
+                                              'Monthly SLA editor'))
+                    row = updated
+                rows.append(row)
+            if events:
+                save_safety_backup(store, 'before-update')
+                imported = dict(imported, rows=rows, created=datetime.now(timezone.utc).isoformat())
+                settings.update(imported=imported, data_revision=secrets.token_hex(12), publication_state='pending')
+                persist_edit(report_workspace, settings, events)
+            reports = imported_snapshot(imported)['reports']['monthly']
+        production_cache.invalidate()
+        return jsonify(saved=True, updated_count=len(events), rows=reports,
+                       message=f'{len(events)} SLA changes saved to the imported report.' if events else
+                       'The selected orders already have this SLA status.')
+
     @app.post('/api/sla-comments')
     @app.post('/api/sla-comments/bulk')
     def update_sla_comment():
-        if report_workspace.read()['mode'] == 'excel':
-            return jsonify(error='Edit the source workbook and reimport it to change imported SLA values.'), 409
         body = request.get_json(silent=True)
         if not isinstance(body, dict):
             raise ValueError('An SLA update is required.')
@@ -834,6 +887,9 @@ def create_app(root=None, runner=None, syncer=None, start_scheduler=False, time_
         status = 'Missing' if body.get('status') == 'Missed' else body.get('status')
         if status not in ('On Time', 'Missing'):
             raise ValueError('Choose On Time or Missing.')
+        mode = report_workspace.read()['mode']
+        if body.get('mode', 'tracker') != mode:
+            return jsonify(error='The report source changed. Refresh the report before editing.'), 409
         selection = {}
         for order in orders:
             if not isinstance(order, dict):
@@ -848,13 +904,23 @@ def create_app(root=None, runner=None, syncer=None, start_scheduler=False, time_
             datetime.strptime(completion, '%Y-%m-%d')
             if expected not in ('On Time', 'Missing'):
                 raise ValueError('Each selection must include its current SLA status.')
-            key = (identity, completion)
+            if mode == 'excel':
+                record_key = order.get('record_key')
+                if not isinstance(record_key, str) or not record_key or len(record_key) > 4096:
+                    raise ValueError('A valid imported record identifier is required.')
+                key = (record_key, identity, completion)
+            else:
+                key = (identity, completion)
             if key in selection:
                 raise ValueError('Each order and completion date must be selected only once.')
             selection[key] = expected
         if not gate.acquire(blocking=False):
             return jsonify(error='A sync or extraction is running. Save the SLA change after it finishes.'), 409
         try:
+            if report_workspace.read()['mode'] != mode:
+                return jsonify(error='The report source changed. Refresh the report before editing.'), 409
+            if mode == 'excel':
+                return update_imported_sla(selection, status)
             try:
                 book, sheet_rows, headers = read_sla_sheets()
             except Exception:
@@ -1085,16 +1151,8 @@ def create_app(root=None, runner=None, syncer=None, start_scheduler=False, time_
                     raise RuntimeError('Extraction did not save a new preview; existing data was retained.')
                 saved = store.get(preview_id)
                 invalidate_snapshot()
-                frame, saved, _, _ = prepare_sync(preview_id)
                 with state_lock:
-                    if cancel_capture.is_set():
-                        raise CaptureCancelled()
-                    state.update(action='sync', stage=f"Syncing {saved['name']} to Google Sheets")
-                drain_earlier_previews(frame.attrs['preview_id'])
-                worksheets = upload_sync(frame)
-                with state_lock:
-                    state.update(result=dict(result, action='sync', google_sheet='success', worksheets=worksheets,
-                                             pass_report=frame.attrs.get('pass_report')), stage='Finished')
+                    state.update(stage='Finished', result=dict(result, action='extract', saved_locally=True, google_sheet='manual'))
             except CaptureCancelled:
                 with state_lock:
                     state.update(stage='Extraction cancelled', result={'cancelled': True, 'error': None,
@@ -1261,11 +1319,17 @@ def create_app(root=None, runner=None, syncer=None, start_scheduler=False, time_
         finally:
             gate.release()
 
+    def preview_history_state():
+        return dict(previews=store.list(), pending_sync=store.pending_count(), **store.reset_status())
+
     @app.delete('/api/previews/<int:number>')
     def delete_preview(number):
         if not gate.acquire(blocking=False):
             return jsonify(error='Wait for extraction or sync to finish before deleting a preview.'), 409
         try:
+            with queue_lock:
+                if queued_ids:
+                    return jsonify(error='Wait for queued syncs to finish before deleting a preview.'), 409
             # Verify the ID before writing a backup, and fail closed if it cannot be saved.
             store.get(number)
             from workspace_backup import save_safety_backup
@@ -1273,11 +1337,14 @@ def create_app(root=None, runner=None, syncer=None, start_scheduler=False, time_
                 backup = save_safety_backup(store, 'before-delete')
             except OSError:
                 return jsonify(error='The recovery copy could not be saved. Check free disk space; the capture was not deleted.'), 503
-            store.delete(number)
+            with preview_recovery_lock:
+                store.delete(number)
             invalidate_snapshot()
             production_cache.invalidate()
-            production_cache.reload()
-            return jsonify(deleted=number, recovery_backup=backup.name)
+            if not store.list():
+                with state_lock:
+                    state.update(result=None, stage='Idle')
+            return jsonify(deleted=number, recovery_backup=backup.name, **preview_history_state())
         finally:
             gate.release()
 
@@ -1286,9 +1353,12 @@ def create_app(root=None, runner=None, syncer=None, start_scheduler=False, time_
         if not gate.acquire(blocking=False):
             return jsonify(error='Wait for extraction or sync to finish before deleting previews.'), 409
         try:
+            with queue_lock:
+                if queued_ids:
+                    return jsonify(error='Wait for queued syncs to finish before deleting previews.'), 409
             payload = request.get_json(silent=True) or {}
             raw_ids = payload.get('ids', [])
-            ids = [int(i) for i in raw_ids if str(i).isdecimal()]
+            ids = {int(i) for i in raw_ids if str(i).isdecimal()}
             if not ids:
                 return jsonify(error='No preview IDs provided for deletion.'), 400
 
@@ -1298,18 +1368,47 @@ def create_app(root=None, runner=None, syncer=None, start_scheduler=False, time_
             except OSError:
                 return jsonify(error='The recovery copy could not be saved. Check free disk space; captures were not deleted.'), 503
 
-            deleted_ids = []
-            for number in ids:
-                try:
-                    store.delete(number)
-                    deleted_ids.append(number)
-                except Exception:
-                    pass
+            with preview_recovery_lock:
+                deleted_ids = store.delete_many(ids)
 
             invalidate_snapshot()
             production_cache.invalidate()
-            production_cache.reload()
-            return jsonify(deleted=deleted_ids, recovery_backup=backup.name)
+            if not store.list():
+                with state_lock:
+                    state.update(result=None, stage='Idle')
+            return jsonify(deleted=deleted_ids, recovery_backup=backup.name, **preview_history_state())
+        finally:
+            gate.release()
+
+    @app.post('/api/previews/reset')
+    @app.post('/api/previews/reset/undo')
+    def reset_capture_history():
+        undo = request.path.endswith('/undo')
+        if not gate.acquire(blocking=False):
+            return jsonify(error='Wait for extraction or sync to finish before changing capture history.'), 409
+        try:
+            with queue_lock:
+                if queued_ids:
+                    return jsonify(error='Wait for queued syncs to finish before changing capture history.'), 409
+            with preview_recovery_lock:
+                try:
+                    if undo:
+                        count = store.undo_preview_reset()
+                        result = {'restored': count}
+                    else:
+                        from workspace_backup import save_safety_backup
+                        backup = save_safety_backup(store, 'before-delete')
+                        count = store.reset_previews()
+                        result = {'deleted': count, 'recovery_backup': backup.name}
+                except ValueError as exc:
+                    return jsonify(error=str(exc)), 409
+                except OSError:
+                    return jsonify(error='The recovery copy could not be saved. Capture history was kept.'), 503
+                invalidate_snapshot()
+            with state_lock:
+                state.update(result=None, stage='Idle')
+            production_cache.invalidate()
+            return jsonify(**result, **preview_history_state())
         finally:
             gate.release()
 

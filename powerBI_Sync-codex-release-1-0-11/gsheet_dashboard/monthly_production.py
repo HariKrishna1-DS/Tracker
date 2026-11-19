@@ -63,7 +63,9 @@ def local_datetime(value):
         return datetime.fromisoformat(raw.replace('Z', '+00:00')).replace(tzinfo=None)
     except ValueError:
         pass
-    for pattern in ('%m/%d/%Y %I:%M:%S %p', '%m/%d/%Y %I:%M %p', '%m/%d/%Y %H:%M:%S',
+    for pattern in ('%d-%m-%Y', '%d-%m-%Y %H:%M:%S', '%d-%m-%Y %H:%M',
+                    '%d-%m-%Y %I:%M:%S %p', '%d-%m-%Y %I:%M %p',
+                    '%m/%d/%Y %I:%M:%S %p', '%m/%d/%Y %I:%M %p', '%m/%d/%Y %H:%M:%S',
                     '%m/%d/%Y %H:%M', '%m/%d/%Y', '%m/%d/%y %I:%M:%S %p', '%m/%d/%y'):
         try:
             return datetime.strptime(raw.upper(), pattern)

@@ -156,6 +156,10 @@ def timestamp(value):
     return local_datetime(value)
 
 
+def received_at(row):
+    return timestamp(row.get('_received_at')) or timestamp(row.get('In-Time')) or timestamp(row.get('Date'))
+
+
 def deadline(raw, anchor):
     raw = text(raw)
     parsed = timestamp(raw)
@@ -165,7 +169,7 @@ def deadline(raw, anchor):
         return None  # Relative deadlines need the capture time, never the current wall clock.
     for fmt in ('%m/%d %I:%M %p', '%m/%d %I:%M:%S %p', '%m/%d %H:%M'):
         try:
-            return datetime.strptime(raw, fmt).replace(year=anchor.year)
+            return datetime.strptime(f'{anchor.year:04d}/{raw}', f'%Y/{fmt}')
         except ValueError:
             pass
     match = re.fullmatch(r'(-)?(?:(\d+)d\s*)?(?:(\d+)h\s*)?(?:(\d+)m\s*)?', raw, re.I)
@@ -436,7 +440,7 @@ def import_default_details(book):
 def sheet_reports(trackers, audit=None):
     """All totals originate in tracker rows returned by Google Sheets."""
     from sla_comments import sla_entry, sla_status
-    from monthly_production import arrival_sort, tab_identity, local_datetime
+    from monthly_production import arrival_sort, tab_identity
     from production_timing import sla_eligible, completion_from_out_time, status as order_status, completed as is_completed
     rows = [dict(completion_from_out_time(row), _sheet=row.get('_sheet', title), _tracker=(tab_identity(title) or (title, ''))[0],
                  _month=row.get('_month') or (tab_identity(title) or ('', ''))[1])
@@ -453,7 +457,7 @@ def sheet_reports(trackers, audit=None):
     groups = {'daily': {}, 'monthly': {}}
     completed_months = {}
     for row in rows:
-        date = local_datetime(row.get('_received_at')) or local_datetime(row.get('In-Time')) or timestamp(row.get('Date'))
+        date = received_at(row)
         day = date.strftime('%Y-%m-%d') if date else 'Undated'
         if daily_owners[key(row)] is row:
             groups['daily'].setdefault(day, []).append(row)
@@ -571,6 +575,14 @@ def sync_trackers(frame=None, on_progress=None, book=None):
         digest = hashlib.sha256(json.dumps(incoming, sort_keys=True, default=str).encode()).hexdigest()
         preview_id = frame.attrs.get('preview_id') if frame is not None else 0
         receipt = store.get_sync_report(preview_id, include_staged=True)
+        local_preview = preview
+        last = max((int(name[7:]) for name in committed), default=0)
+        if preview_id and store.restarted_numbering():
+            if receipt:
+                preview = receipt['report'].get('_cloud_preview', preview)
+            else:
+                # The capture library can restart while the shared archive keeps its sequence.
+                preview = f'preview{last + 1}'
         if frame is None and receipt and receipt['committed']:
             if publish_tracker_reports:
                 refresh_monthly_views(book)
@@ -598,9 +610,9 @@ def sync_trackers(frame=None, on_progress=None, book=None):
                 ensure_tracker_formatting(book)
             frame.attrs['pass_report'] = {k: v for k, v in receipt['report'].items() if not k.startswith('_')} if receipt else {}
             return list(TRACKERS) + ['All Products', 'Sheet1']
-        if frame is not None and frame.attrs.get('preview_id'):
-            last = max((int(name[7:]) for name in committed), default=0)
-            if frame.attrs['preview_id'] < last:
+        if preview_id:
+            number = int(preview[7:]) if re.fullmatch(r'preview[1-9]\d*', preview) else preview_id
+            if number < last:
                 raise ValueError('An unsynced older preview cannot overwrite a newer tracker state. Review it in history.')
         defaults = load_defaults()
         current, additions, requests, saved_values, conflicts = {}, {}, [], {}, []
@@ -665,7 +677,7 @@ def sync_trackers(frame=None, on_progress=None, book=None):
                     row['Free Site'], reason = free_site(row, anchor)
                     if reason:
                         report['ambiguous'].append({'Order Number': row['Order Number'], 'Reason': reason})
-        report.update(preview_name=preview, timestamp=anchor.isoformat(),
+        report.update(preview_name=local_preview, _cloud_preview=preview, timestamp=anchor.isoformat(),
                       seeded=sum(len(v) for v in additions.values()),
                       default_conflicts_count=len(conflicts), default_conflicts=conflicts)
 

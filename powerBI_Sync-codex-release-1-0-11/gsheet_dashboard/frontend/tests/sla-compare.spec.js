@@ -1,6 +1,105 @@
 import {test, expect} from '@playwright/test';
 import {workspaceFixture} from './workspace-fixture.js';
 
+test('comparison status and order actions persist edits, copies and additions in the selected preview', async ({page}) => {
+  const fixture = workspaceFixture(2), saves = [], errors = [];
+  let custom = [], productionStatus = 'QC in Progress';
+  const rows = [{'Order Number': 'EDIT-1', Status: 'Search In Progress', Borrower: 'Original borrower',
+    'SLA Expiration': '2030-06-15 14:30:00', 'SLA Category': 'Future SLA', _sla_revision: 'r1'}];
+  const previews = [{id: 7, name: 'preview7', row_count: 1}];
+  function comparison() {
+    const orders = rows.map(row => ({order_number: row['Order Number'], sla_status: row.Status,
+      prod_status: productionStatus, match_type: 'status_moved', sla_category: 'Future SLA'}));
+    return {has_production: true, selected_preview_id: 7, previews, preview_name: 'preview7', orders,
+      metrics: {matched: rows.length, status_moved: rows.length}, transitions: [],
+      sla_summary: {rows: [{Status: productionStatus, 'Future SLA': rows.length, 'Grand Total': rows.length}],
+        totals: {'Future SLA': rows.length, 'Grand Total': rows.length}}};
+  }
+  await page.route('**/api/**', async route => {
+    const url = new URL(route.request().url()), name = url.pathname;
+    let body = fixture.response(name);
+    if (name === '/api/sla-compare') body = comparison();
+    if (name === '/api/sla-status') body = {...body, report_scope: 'preview', preview_id: 7, preview_name: 'preview7',
+      previews, preview_row_count: rows.length, rows, excluded_rows: [], custom_statuses: custom, summary: [{Status: 'Search In Progress'}]};
+    if (name === '/api/sla-statuses') {
+      const payload = route.request().postDataJSON(); saves.push(payload);
+      custom = [...custom.filter(status => status !== payload.previous), payload.status]; body = {status: payload.status};
+    }
+    if (name === '/api/sla-compare/update-status') {
+      const payload = route.request().postDataJSON(); saves.push(payload);
+      if (payload.prod_status === 'Rejected status') return route.fulfill({status: 409, json: {error: 'Status changed. Refresh and try again.'}});
+      productionStatus = payload.prod_status; body = {ok: true};
+    }
+    if (name === '/api/sla-order') {
+      if (route.request().method() === 'GET') {
+        const row = rows.find(row => row['Order Number'] === url.searchParams.get('order_number'));
+        body = {exists: !!row, row, fields: row, revision: row?._sla_revision || null};
+      } else {
+        const payload = route.request().postDataJSON(); saves.push(payload);
+        let row = rows.find(row => row['Order Number'] === payload.order_number);
+        if (!row) {row = {'Order Number': payload.order_number}; rows.push(row);}
+        Object.assign(row, payload.fields, {Status: payload.status, _sla_revision: 'r2'});
+        body = {order_number: payload.order_number, status: payload.status};
+      }
+    }
+    await route.fulfill({json: body});
+  });
+  page.on('pageerror', err => errors.push(err.message));
+  await page.goto('/');
+  await page.getByRole('button', {name: 'SLA Compare', exact: true}).click();
+  await page.getByRole('button', {name: 'Edit status QC in Progress', exact: true}).click();
+  let dialog = page.getByRole('dialog', {name: 'Edit comparison status name', exact: true});
+  await dialog.getByRole('button', {name: 'Choose SLA order status'}).click();
+  await expect(dialog.getByRole('option', {name: 'QC in Progress', exact: true})).toBeVisible();
+  const list=dialog.getByRole('listbox');
+  await expect(list).toHaveCSS('position','relative');
+  const listBox=await list.boundingBox(),saveBox=await dialog.getByRole('button',{name:'Save status',exact:true}).boundingBox();
+  expect(saveBox.y).toBeGreaterThanOrEqual(listBox.y+listBox.height);
+  await dialog.getByRole('option', {name: 'Search In Progress', exact: true}).click();
+  await expect(dialog.getByLabel('Comparison status name')).toHaveValue('Search In Progress');
+  await expect(dialog.getByRole('listbox')).toHaveCount(0);
+  await dialog.getByLabel('Comparison status name').fill('Rejected status');
+  await dialog.getByRole('button', {name: 'Save status', exact: true}).click();
+  await expect(dialog.getByRole('alert')).toContainText('Status changed');
+  await dialog.getByLabel('Comparison status name').fill('Review pending');
+  await dialog.getByRole('button', {name: 'Save status', exact: true}).click();
+  await expect(page.getByRole('button', {name: 'Edit status Review pending', exact: true})).toBeVisible();
+  await page.getByRole('button', {name: 'Review pending', exact: true}).click();
+  dialog = page.getByRole('dialog');
+  await expect(dialog.getByRole('columnheader', {name: 'Actions', exact: true})).toBeVisible();
+  await page.screenshot({path: 'test-results/sla-compare-edit-actions.png', fullPage: true});
+  await dialog.getByRole('button', {name: 'Edit details EDIT-1', exact: true}).click();
+  let editor = page.getByRole('dialog', {name: 'Edit SLA order', exact: true});
+  await expect(editor.getByLabel('Borrower', {exact: true})).toHaveValue('Original borrower');
+  await editor.getByLabel('Borrower', {exact: true}).fill('Updated borrower');
+  await editor.getByRole('button', {name: 'Save order', exact: true}).click();
+  await expect(editor).toHaveCount(0);
+  expect(saves.at(-1)).toMatchObject({preview_id: 7, order_number: 'EDIT-1', expected_revision: 'r1', fields: {Borrower: 'Updated borrower'}});
+  await page.getByRole('button', {name: 'Review pending', exact: true}).click();
+  await page.getByRole('dialog').getByRole('button', {name: 'Copy order EDIT-1', exact: true}).click();
+  editor = page.getByRole('dialog', {name: 'Copy SLA order', exact: true});
+  await expect(editor.getByLabel('SLA Order Number', {exact: true})).toHaveValue('');
+  await editor.getByLabel('SLA Order Number', {exact: true}).fill('COPY-1');
+  await editor.getByRole('button', {name: 'Look up order', exact: true}).click();
+  await editor.getByRole('button', {name: 'Add order', exact: true}).click();
+  await expect(editor).toHaveCount(0);
+  expect(saves.at(-1)).toMatchObject({preview_id: 7, order_number: 'COPY-1', fields: {Borrower: 'Updated borrower'}});
+  const addStatus = page.getByRole('button', {name: 'Add status', exact: true});
+  await expect(addStatus).toBeVisible();
+  await addStatus.click();
+  await page.getByLabel('Comparison status name').fill('Manual review');
+  await page.getByRole('button', {name: 'Save status', exact: true}).click();
+  await page.getByRole('button', {name: 'Add order to status Manual review', exact: true}).click();
+  editor = page.getByRole('dialog', {name: 'Add SLA order', exact: true});
+  await expect(editor.getByLabel('SLA order status', {exact: true})).toHaveValue('Manual review');
+  await editor.getByRole('button', {name: 'Cancel', exact: true}).click();
+  const search = page.getByRole('textbox', {name: 'Search comparison orders', exact: true});
+  await search.fill('EDIT-1');
+  await page.getByRole('button', {name: 'Edit SLA order EDIT-1', exact: true}).click();
+  await expect(page.getByRole('dialog', {name: 'Edit SLA order', exact: true})).toBeVisible();
+  expect(errors).toEqual([]);
+});
+
 test('Negative SLA popup retains the SLA Status order set after production status edits', async ({page}) => {
   const fixture = workspaceFixture(3);
   const errors = [];
@@ -11,6 +110,7 @@ test('Negative SLA popup retains the SLA Status order set after production statu
     {order_number: 'TODAY', match_type: 'same_status', sla_category: 'Today SLA', sla_status: 'QC in Progress', prod_status: 'QC in Progress', sla_expiration: '1d'},
     {order_number: 'PROD-ONLY', match_type: 'prod_only', sla_category: 'Not in SLA Queue', sla_status: 'Not in SLA Queue', prod_status: 'QC in Progress', sla_expiration: ''},
     {order_number: 'HOME-1', match_type: 'sla_only', sla_category: 'Future SLA', sla_status: 'Home Builders', prod_status: 'Home Builders', sla_expiration: '2030-06-15 14:30:00'},
+    {order_number: 'CANCEL-1', match_type: 'same_status', sla_category: 'Unknown SLA', sla_status: 'Cancelled', prod_status: 'Cancelled'},
   ];
   await page.route('**/api/**', async route => {
     const name = new URL(route.request().url()).pathname;
@@ -21,8 +121,9 @@ test('Negative SLA popup retains the SLA Status order set after production statu
       source_files: 'production.xlsx', metrics: {total_sla: 3, total_production: 3, matched: 2, status_moved: 1, same_status: 1, sla_only: 1, prod_only: 1},
       transitions: [], sla_summary: {
         rows: [{Status: 'QC in Progress', 'Negative SLA': 1, 'Today SLA': 1, 'Grand Total': 2},
-          {Status: 'Home Builders', 'Future SLA': 1, 'Grand Total': 1}],
-        totals: {'Negative SLA': 1, 'Today SLA': 1, 'Future SLA': 1, 'Grand Total': 3},
+          {Status: 'Home Builders', 'Future SLA': 1, 'Grand Total': 1},
+          {Status: 'Cancelled', 'Unknown SLA': 1, 'Grand Total': 1}],
+        totals: {'Negative SLA': 1, 'Today SLA': 1, 'Future SLA': 1, 'Unknown SLA': 1, 'Grand Total': 4},
       },
     };
     if (name === '/api/sla-compare/update-status') body = {ok: true};
@@ -30,6 +131,15 @@ test('Negative SLA popup retains the SLA Status order set after production statu
   });
   await page.goto('/');
   await page.getByRole('button', {name: 'SLA Compare', exact: true}).click();
+  const matrix=page.getByRole('table', {name:'SLA Status Summary Table'});
+  const cancelled=matrix.getByRole('rowheader', {name:/Cancelled/});
+  const removeCancelled=cancelled.getByRole('button',{name:'Remove Cancelled from summary'});
+  await expect(removeCancelled).toBeVisible();
+  expect(await removeCancelled.evaluate(button=>button.previousElementSibling?.getAttribute('aria-label'))).toBe('Add order to status Cancelled');
+  await removeCancelled.click();
+  await expect(matrix.getByRole('rowheader', {name:/Cancelled/})).toHaveCount(0);
+  await expect(matrix.locator('.matrix-total-row td').last()).toHaveText('3');
+  await expect(page.getByRole('link', {name:'Download Summary (Excel)'})).toHaveAttribute('href', /exclude_cancelled=1/);
   const negative = page.getByTitle('Click to open Pop Table for all Negative SLA orders', {exact: true});
   await expect(negative).toHaveText('1');
   await negative.click();

@@ -11,6 +11,8 @@ import './workspaceRefresh.css';
 import './workspaceSystem.css';
 import './slaCompareDesign.css';
 import './slaTypography.css';
+import './tableGrid.css';
+import './workspaceContext.css';
 import {OrdersWorkspace, ProductionOverview, OperationActivity, ThemeControl, VIEW_TITLES} from './StudioWorkspace';
 import ReportControls from './ReportControls';
 const CapacityReport = React.lazy(() => import('./CapacityReport'));
@@ -95,6 +97,7 @@ function StatusReport({rows}) {
 
 
 function App() {
+  const productionReportSession=useRef({});
   const [state,setState]=useState({previews:[],job:{running:false,stage:'Ready'}}), [selected,setSelected]=useState(null), [preview,setPreview]=useState(EMPTY), [view,setView]=useState('sla');
   const [reportMode,setReportMode]=useState('tracker'), [reportRevision,setReportRevision]=useState(0), [reportImportOpen,setReportImportOpen]=useState(false);
   const [previous,setPrevious]=useState(''), [diff,setDiff]=useState(null), [keys,setKeys]=useState([]), [ignore,setIgnore]=useState(DEFAULT_IGNORE), [compareBusy,setCompareBusy]=useState(false), [compareError,setCompareError]=useState('');
@@ -110,6 +113,8 @@ function App() {
   const sourceKey=`${dataSourceKey}:${reportRevision}`;
   const sourceEditVersion=useRef(0);
   const [deleteMessage,setDeleteMessage]=useState('');
+  const [deletingPreviews,setDeletingPreviews]=useState(false);
+  const previewHistoryVersion=useRef(0);
   const seen=useRef(null), scheduleLoaded=useRef(false), remainingLoaded=useRef(false), refreshRequest=useRef(null), jobRunning=useRef(false);
   const [compareAttempt,setCompareAttempt]=useState(0);
   const [sheetGroup,setSheetGroup]=useState('all'), [scheduleMessage,setScheduleMessage]=useState('');
@@ -161,8 +166,9 @@ function App() {
     if(refreshRequest.current)return refreshRequest.current;
     refreshRequest.current=(async()=>{
     const editVersion=sourceEditVersion.current;
+    const captureVersion=previewHistoryVersion.current;
     const next=await api('/api/state?light=1');
-    if(editVersion!==sourceEditVersion.current)return;
+    if(editVersion!==sourceEditVersion.current||captureVersion!==previewHistoryVersion.current)return;
     setState(next);setConnectionError('');setReportMode(next.report_workspace?.mode||'tracker');jobRunning.current=next.job.running;
     if(next.schedule&&!scheduleLoaded.current){
       const times = next.schedule.times && next.schedule.times.length ? next.schedule.times : [next.schedule.time || '09:00'];
@@ -327,6 +333,9 @@ function App() {
     if(next.mode==='excel')setSelectedRemainingProducts([]);else remainingLoaded.current=false;
     await refresh();
   }
+  const [sheetSync,setSheetSync]=useState(false);
+  useEffect(()=>{api('/api/sheet-sync').then(value=>setSheetSync(value.enabled)).catch(()=>{});},[]);
+  async function toggleSheetSync(){try{const value=await api('/api/sheet-sync',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:!sheetSync})});setSheetSync(value.enabled);}catch(e){setError(e.message);}}
   async function syncSheets(){setPending(true);setError('');try{
     if(reportMode==='excel'||!selected){const result=await api('/api/report-publish',{method:'POST',timeoutMs:180000});if(!result.synced&&!result.queued)throw Error(result.sync_error);}
     else {
@@ -372,15 +381,51 @@ function App() {
 
   function choosePrevious(value){setPrevious(value);if(!value)return;const index=state.previews.findIndex(p=>p.id===Number(value));const newer=state.previews[index-1];if(newer)setSelected(newer.id);}
   function chooseLatest(value){const id=Number(value);setSelected(id);const index=state.previews.findIndex(p=>p.id===id);setPrevious(String(state.previews[index+1]?.id||''));}
-  async function deletePreview(event,id){event.stopPropagation();const target=state.previews.find(p=>p.id===id);if(!window.confirm(`Delete ${target?.name||`preview${id}`} and its saved CSV/Excel files? A workspace recovery copy will be saved first. You can restore it in Settings > Local data & recovery.`))return;setError('');setDeleteMessage('');try{const deleted=await api(`/api/previews/${id}`,{method:'DELETE'});if(deleted.recovery_backup)setDeleteMessage(`Capture deleted. Recovery copy: ${deleted.recovery_backup}. Find it in your workspace backups folder; restore it through Settings.`);invalidateProduction();const next=await api('/api/state?light=1');setState(next);seen.current=next.previews[0]?.id??null;const nextSelected=id===selected?(next.previews[0]?.id??null):selected;setSelected(nextSelected);const index=next.previews.findIndex(p=>p.id===nextSelected);setPrevious(String(next.previews[index+1]?.id||''));if(!nextSelected){setPreview(EMPTY);setDiff(null);}refreshProduction();}catch(e){setError(e.message);}}
-  async function batchDeletePreviews(ids){if(!ids||!ids.length)return;if(!window.confirm(`Delete ${ids.length} selected captures and their saved files? A workspace recovery copy will be saved first. You can restore it in Settings > Local data & recovery.`))return;setError('');setDeleteMessage('');try{const deleted=await api('/api/previews/batch-delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ids})});if(deleted.recovery_backup)setDeleteMessage(`${deleted.deleted_count||ids.length} captures deleted. Recovery copy: ${deleted.recovery_backup}.`);invalidateProduction();const next=await api('/api/state?light=1');setState(next);seen.current=next.previews[0]?.id??null;const nextSelected=ids.includes(selected)?(next.previews[0]?.id??null):selected;setSelected(nextSelected);const index=next.previews.findIndex(p=>p.id===nextSelected);setPrevious(String(next.previews[index+1]?.id||''));if(!nextSelected){setPreview(EMPTY);setDiff(null);}refreshProduction();}catch(e){setError(e.message);}}
+  async function applyCaptureHistory(result){
+    previewHistoryVersion.current++;
+    const history=Array.isArray(result.previews)?result:await api('/api/state?light=1');
+    const clearSelection=!history.previews.length;
+    invalidateProduction();
+    seen.current=history.previews[0]?.id??null;
+    setState(current=>({...current,previews:history.previews,pending_sync:history.pending_sync,
+      job:clearSelection?{...current.job,result:null,stage:'Idle'}:current.job}));
+    const nextSelected=!clearSelection&&history.previews.some(preview=>preview.id===selected)?selected:seen.current;
+    const index=history.previews.findIndex(preview=>preview.id===nextSelected);
+    setSelected(nextSelected);
+    setPrevious(String(history.previews[index+1]?.id||''));
+    if(clearSelection||!nextSelected){
+      setPreview(EMPTY);
+      setLoading(false);
+      setDiff(null);
+    }
+    refreshProduction();
+  }
+
+  async function removePreviews(ids, single=false){
+    if(deletingPreviews||!ids.length)return;
+    const prompt=`Delete ${single?`preview${ids[0]}`:`${ids.length} selected captures`} and their saved files? A recovery copy will be saved first.`;
+    if(!window.confirm(prompt))return;
+    setDeletingPreviews(true);
+    setError('');
+    setDeleteMessage('');
+    try{
+      const result=await api(single?`/api/previews/${ids[0]}`:'/api/previews/batch-delete',single?{method:'DELETE'}:
+        {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ids})});
+      await applyCaptureHistory(result);
+      const count=single?1:result.deleted.length;
+      setDeleteMessage(`${count} ${count===1?'capture':'captures'} deleted.${count&&!result.previews.length?' The next capture will be preview1.':''}${result.recovery_backup?` Recovery copy: ${result.recovery_backup}.`:''}`);
+    }catch(e){setError(e.message);}
+    finally{setDeletingPreviews(false);}
+  }
+  function deletePreview(event,id){event.stopPropagation();return removePreviews([id],true);}
+  function batchDeletePreviews(ids){return removePreviews(ids);}
   async function downloadChanges(){try{const response=await fetch('/api/compare',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({previous:Number(previous),latest:selected,keys,ignore,download:true})});if(!response.ok)throw Error((await response.json()).error);saveBlob(await response.blob(),`${diff.previous}-to-${diff.latest}-changes.xlsx`);}catch(e){setError(e.message);}}
-  const running=state.job.running||pending||uploading, result=state.job.result;
+  const running=state.job.running||pending||uploading||deletingPreviews, result=state.job.result;
   return <div className={`workspace ${sidebarCollapsed?'sidebar-collapsed':''}`} data-view={view}>
     <a className="skip-link" href="#workspace-content">Skip to workspace</a>
     <WorkspaceSidebar state={state} selected={selected} view={view} onNavigate={navigate} collapsed={sidebarCollapsed} onToggle={()=>{if(sidebarReady)setSidebarCollapsed(!sidebarCollapsed).catch(()=>{});}} snapshot={liveSheets} busy={running} onRefresh={refreshProduction} refreshing={refreshingProduction} onDelete={deletePreview} onBatchDelete={batchDeletePreviews} onSelect={id=>{setSelected(id);navigate('captures');const index=state.previews.findIndex(p=>p.id===id);setPrevious(String(state.previews[index+1]?.id||''));}}/>
-    <main ref={mainScroll}><header className="topbar"><div className="breadcrumb"><span>Workspace</span><ChevronRight size={13}/><strong>{VIEW_TITLES[view]}</strong></div><div className="topbar-report-source"><ReportControls mode={reportMode} running={running} open={reportImportOpen} setOpen={setReportImportOpen} onChanged={reportsChanged} onBusy={setUploading} workspaceState={state.report_workspace}/></div><div className="inline topbar-actions"><DesktopTools onNavigate={navigate} onImport={()=>setReportImportOpen(true)} running={running}/><span className={`run-state ${running?'running':''}`}>{running&&<LoaderCircle size={14} className="spin"/>}{pending&&!state.job.running?'Starting…':state.job.stage}</span><button className="secondary" onClick={()=>setReportImportOpen(true)} disabled={uploading}><Upload size={16}/>{uploading?'Importing…':'Import files'}</button><button className="secondary" onClick={exportSheets} disabled={exporting||running} title="Download the selected report source as Excel">{exporting?<LoaderCircle size={16} className="spin"/>:<ArrowDownToLine size={16}/>} {exporting?'Exporting...':'Export'}</button><NavbarPreferences/></div></header>
-      <div className="content" id="workspace-content" tabIndex={-1}><div className="page-heading"><div><h1>{VIEW_TITLES[view]}</h1><p className="muted">{({daily:'Daily production, completion, and order details.',monthly:'Monthly trends and production performance.',sla:'Monitor deadlines and orders that need attention.',slaCompare:'Compare queue statuses with your production reports.',capacity:'Plan capacity and track daily workload.',changes:'Review what changed between saved captures.',captures:'Your saved snapshots, organized and ready to explore.',captureDetail:preview.name?`${preview.name} · ${new Date(preview.created).toLocaleString()}`:'Explore your saved capture.',importChanges:'Review edits from imported workbooks.',audit:'Your capture and synchronization history.',sheets:'All your production orders in one place.',overview:'Your production, clearly organized.'})[view]}</p></div><div className="page-actions"><button className="secondary" onClick={syncSheets} disabled={running||loading||compareBusy||!!compareError}>{state.job.action==='sync'&&running?<LoaderCircle size={17} className="spin"/>:<CloudUpload size={17}/>}<span>{state.job.action==='sync'&&running?'Syncing…':'Sync to Sheets'}</span></button><details className="sync-schedule"><summary><Clock3 size={16}/><span>AutoLogin Trigger</span><span className={`schedule-state ${state.schedule?.enabled?'enabled':''}`}>{state.schedule?.enabled?'On':'Paused'}</span></summary><div>
+    <main ref={mainScroll}><header className="topbar"><div className="breadcrumb"><span>Workspace</span><ChevronRight size={13}/><strong>{VIEW_TITLES[view]}</strong></div><div className="topbar-report-source"><ReportControls mode={reportMode} running={running} open={reportImportOpen} setOpen={setReportImportOpen} onChanged={reportsChanged} onBusy={setUploading} workspaceState={state.report_workspace}/></div><div className="inline topbar-actions"><DesktopTools onNavigate={navigate} onImport={()=>setReportImportOpen(true)} running={running}/><span className={`run-state ${running?'running':''}`}>{running&&<LoaderCircle size={14} className="spin"/>}{pending&&!state.job.running?'Starting…':state.job.stage}</span><button className="secondary" onClick={()=>setReportImportOpen(true)} disabled={uploading}><Upload size={16}/>{uploading?'Importing…':'Import files'}</button><button className="secondary" onClick={exportSheets} disabled={exporting||running} title="Download the selected report source as Excel">{exporting?<LoaderCircle size={16} className="spin"/>:<ArrowDownToLine size={16}/>} {exporting?'Exporting...':'Export'}</button><button className="secondary" role="switch" aria-checked={sheetSync} onClick={toggleSheetSync}>Sheet_sync {sheetSync?'On':'Off'}</button><NavbarPreferences/></div></header>
+      <div className="content" id="workspace-content" tabIndex={-1}><div className="page-heading"><div><h1>{VIEW_TITLES[view]}</h1><p className="muted">{({daily:'Daily production, completion, and order details.',monthly:'Monthly trends and production performance.',sla:'Monitor deadlines and orders that need attention.',slaCompare:'Compare queue statuses with your production reports.',capacity:'Plan capacity and track daily workload.',changes:'Review what changed between saved captures.',captures:'Your saved snapshots, organized and ready to explore.',captureDetail:preview.name?`${preview.name} · ${new Date(preview.created).toLocaleString()}`:'Explore your saved capture.',importChanges:'Review edits from imported workbooks.',audit:'Your capture and synchronization history.',sheets:'All your production orders in one place.',overview:'Your production, clearly organized.'})[view]}</p></div><div className="page-actions"><button className="secondary" onClick={syncSheets} disabled={!sheetSync||running||loading||compareBusy||!!compareError}>{state.job.action==='sync'&&running?<LoaderCircle size={17} className="spin"/>:<CloudUpload size={17}/>}<span>{state.job.action==='sync'&&running?'Syncing…':'Sync to Sheets'}</span></button><details className="sync-schedule"><summary><Clock3 size={16}/><span>AutoLogin Trigger</span><span className={`schedule-state ${state.schedule?.enabled?'enabled':''}`}>{state.schedule?.enabled?'On':'Paused'}</span></summary><div>
         <TriggerClock schedule={state.schedule} clock={state.clock} onClearHistory={clearScheduleHistory} clearingHistory={clearingHistory}/>
         <button className="secondary" disabled={savingSchedule||!state.schedule} onClick={()=>saveSchedule(!state.schedule?.enabled,state.schedule?.times||[state.schedule?.time||'09:00'],state.schedule?.days||ALL_DAYS)}>{state.schedule?.enabled?'Pause schedule':'Resume schedule'}</button>
         <div className="schedule-times-label">Scheduled times (IST):</div>
@@ -421,7 +466,7 @@ function App() {
       {result?.pass_report&&!running&&(reportMode==='tracker'||view==='audit')&&<DismissibleNotice key={`scan-${state.job.run_id}`} noticeId={`scan-${state.job.run_id}`} role="status">{result.pass_report.scanned} scanned · {result.pass_report.added} added · {result.pass_report.updated} updated · {result.pass_report.unchanged} unchanged · {reportCount(result.pass_report,'not_in_latest')} not in latest preview</DismissibleNotice>}
       {result?.pass_report&&!running&&(reportMode==='tracker'||view==='audit')&&(reportCount(result.pass_report,'ambiguous')+reportCount(result.pass_report,'unprocessed')>0)&&<DismissibleNotice key={`review-${state.job.run_id}`} noticeId={`review-${state.job.run_id}`} className="notice warning" role="status">{reportCount(result.pass_report,'ambiguous')+reportCount(result.pass_report,'unprocessed')} review items · open Sync activity to review the saved local report.</DismissibleNotice>}
       {view==='audit'&&<><OperationActivity running={running}/><MonthlyActivity/></>}
-      <React.Suspense fallback={<LoadingScreen title="Loading view…"/>}>{view==='productionReport'?<ProductionReport revision={sourceKey}/>:view==='captures'?<CaptureLibrary previews={state.previews} busy={running} onOpen={id=>{chooseLatest(id);navigate('captureDetail');}} onDelete={deletePreview} onBatchDelete={batchDeletePreviews}/>:view==='importChanges'?<ImportExcelChanges revision={sourceKey} onRefresh={refreshProduction} refreshing={refreshingProduction}/>:view==='sla'?<SlaStatus mode={reportMode} revision={sourceKey} onUpdated={()=>{setReportRevision(value=>value+1);refresh().catch(error=>setConnectionError(error.message));}}/>:view==='slaCompare'?<SlaCompare state={state} reportMode={reportMode}/>:!state.previews.length && !liveSheets && !['monthly','audit','capacity'].includes(view) ? <LocalWelcome onImport={()=>setReportImportOpen(true)}/> : view==='overview'?<><ProductionOverview snapshot={liveSheets} state={state} onNavigate={navigate}/><OverviewDashboard key={dataSourceKey} rows={filtered} columns={table.columns} onSelect={setChartSelection} selectedProducts={selectedRemainingProducts} setSelectedProducts={handleProductSelectionChange} savingProducts={savingProducts}/><AdvancedChart rows={filtered} columns={table.columns} onSelect={setChartSelection}/><React.Suspense fallback={null}>{chartSelection&&<SideDrawer title={`${chartSelection.column}: ${chartSelection.value}`} rows={chartRows} columns={table.columns} onClose={()=>setChartSelection(null)}/>}</React.Suspense></>:view==='sheets'?<><SheetSegments imported={liveSheets?.mode==='excel'} value={sheetGroup} onChange={value=>{setSheetGroup(value);setFilterColumn(null);}} counts={Object.fromEntries(Object.entries(sheetTables).map(([key,value])=>[key,value.rows.length]))}/><div className={filterColumn?'data-layout with-filter':'data-layout'}><OrdersWorkspace key={dataSourceKey} snapshot={liveSheets} rows={filtered} columns={table.columns} search={search} setSearch={setSearch} filters={filters} setFilters={setFilters} openFilter={setFilterColumn} previews={state.previews}/>{filterColumn&&<FilterPanel key={filterColumn} column={filterColumn} rows={table.rows} filters={filters} setFilters={setFilters} close={()=>setFilterColumn(null)}/>}</div></>:<>
+      <React.Suspense fallback={<LoadingScreen title="Loading view…"/>}>{view==='productionReport'?<ProductionReport revision={sourceKey} session={productionReportSession}/>:view==='captures'?<CaptureLibrary previews={state.previews} busy={running} onOpen={id=>{chooseLatest(id);navigate('captureDetail');}} onDelete={deletePreview} onBatchDelete={batchDeletePreviews}/>:view==='importChanges'?<ImportExcelChanges revision={sourceKey} onRefresh={refreshProduction} refreshing={refreshingProduction}/>:view==='sla'?<SlaStatus mode={reportMode} revision={sourceKey} onUpdated={()=>{setReportRevision(value=>value+1);refresh().catch(error=>setConnectionError(error.message));}}/>:view==='slaCompare'?<SlaCompare state={state} reportMode={reportMode}/>:!state.previews.length && !liveSheets && !['monthly','audit','capacity'].includes(view) ? <LocalWelcome onImport={()=>setReportImportOpen(true)}/> : view==='overview'?<><ProductionOverview snapshot={liveSheets} state={state} onNavigate={navigate}/><OverviewDashboard key={dataSourceKey} rows={filtered} columns={table.columns} onSelect={setChartSelection} selectedProducts={selectedRemainingProducts} setSelectedProducts={handleProductSelectionChange} savingProducts={savingProducts}/><AdvancedChart rows={filtered} columns={table.columns} onSelect={setChartSelection}/><React.Suspense fallback={null}>{chartSelection&&<SideDrawer title={`${chartSelection.column}: ${chartSelection.value}`} rows={chartRows} columns={table.columns} onClose={()=>setChartSelection(null)}/>}</React.Suspense></>:view==='sheets'?<><SheetSegments imported={liveSheets?.mode==='excel'} value={sheetGroup} onChange={value=>{setSheetGroup(value);setFilterColumn(null);}} counts={Object.fromEntries(Object.entries(sheetTables).map(([key,value])=>[key,value.rows.length]))}/><div className={filterColumn?'data-layout with-filter':'data-layout'}><OrdersWorkspace key={dataSourceKey} snapshot={liveSheets} rows={filtered} columns={table.columns} search={search} setSearch={setSearch} filters={filters} setFilters={setFilters} openFilter={setFilterColumn} previews={state.previews}/>{filterColumn&&<FilterPanel key={filterColumn} column={filterColumn} rows={table.rows} filters={filters} setFilters={setFilters} close={()=>setFilterColumn(null)}/>}</div></>:<>
       {view==='captureDetail'&&<CapturePicker previews={state.previews} selected={selected} onSelect={chooseLatest} onDelete={deletePreview} busy={running}/>}
       {view==='captureDetail'&&preview.id&&<div className="notice" role="status">Raw saved capture · {preview.name}<a className="secondary" href={`/api/previews/${preview.id}/download/xlsx`}>Download Excel</a></div>}{view==='changes'&&<section className="compare-controls"><label>Previous preview<select aria-label="Previous preview" value={previous} onChange={e=>choosePrevious(e.target.value)}><option value="">Select a preview</option>{state.previews.filter(p=>p.id!==selected).map(p=><option key={p.id} value={p.id}>{p.name}</option>)}</select></label><ArrowLeftRight size={18}/><label>Latest preview<select aria-label="Latest preview" value={selected||''} onChange={e=>chooseLatest(e.target.value)}>{state.previews.map(p=><option key={p.id} value={p.id}>{p.name}</option>)}</select></label><span className="muted">Matched by Order Number (ignoring case and surrounding spaces)</span><details className="match-options"><summary>Ignored columns ({ignore.length})</summary><div>{preview.columns.map(c=><label className="check-row" key={c}><input type="checkbox" checked={ignore.includes(c)} onChange={()=>setIgnore(ignore.includes(c)?ignore.filter(k=>k!==c):[...ignore,c])}/>{c}</label>)}</div></details><button className="secondary" disabled={!diff||compareBusy} onClick={downloadChanges}><ArrowDownToLine size={16}/>Power BI changes.xlsx</button></section>}
       {view==='changes'&&compareError&&<div className="notice warning" role="alert">{compareError}<button className="secondary" onClick={()=>setCompareAttempt(value=>value+1)}>Retry comparison</button></div>}

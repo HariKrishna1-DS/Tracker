@@ -49,12 +49,16 @@ async function setup(page,{rejectSave=false,legacyDetailsOnce=false,sameNumberAc
       if(name==='/api/report-date'){settings.data_revision='selected-date';body={date:day,synced:true,highlighted_date:day};}
       if(name==='/api/capacity-report/details'&&url.searchParams.get('month')){
         const month=url.searchParams.get('month'),august=month==='2026-08';
+        if(month==='2026-10'&&url.searchParams.get('aggregate')==='true'){
+          body={...body,date:'',month,daily:[],groups:[{key:'in_house',label:'In-House Pending',rows:fixture.rows.slice(0,47)}]};
+        }else{
         const daily=august?[{Date:'2026-08-20',Received:1,Completed:0}]:[{Date:'2026-09-25',Received:5,Completed:1},{Date:'2026-09-30',Received:1,Completed:0}];
         const date=url.searchParams.get('date')||daily[0].Date;
         const rows=august?fixture.rows.slice(0,1):date==='2026-09-25'?fixture.rows.slice(0,5):fixture.rows.slice(5,6);
         body={...body,date,month,month_label:august?'August 2026':'September 2026',daily,capacity_columns:capacityColumns,
           previous_date:null,next_date:date==='2026-09-25'?'2026-09-30':null,raw_received:rows.length,rollover_received:0,
           groups:[{key:'received',label:'Received',rows},{key:'changes',label:'Recorded changes',rows:changes}]};
+        }
       }
       if(name==='/api/order-details'){
         if(route.request().method()==='GET'){
@@ -85,7 +89,37 @@ async function setup(page,{rejectSave=false,legacyDetailsOnce=false,sameNumberAc
 test('capacity totals sum direct counts and dates open exact received, completed and status groups',async({page})=>{
   const {fixture,writes,errors}=await setup(page);
   await page.getByRole('button',{name:'Capacity Report',exact:true}).click();
-  await expect(page.getByText('Capacity Report uses imported Excel orders. Saturday and Sunday receipts and completions are included on the preceding Friday.',{exact:true})).toBeVisible();
+  const notes=page.getByText('Capacity Report uses imported Excel orders. Saturday and Sunday receipts and completions are included on the preceding Friday.',{exact:true});
+  await expect(notes).toBeHidden();
+  const details=page.getByText('Capacity report details',{exact:true});
+  await details.click();
+  await expect(notes).toBeVisible();
+  await details.click();
+  const trends=page.getByRole('region',{name:'Pending & Backlog Trends'});
+  for(const label of ['In-House Pending','Vendor Pending','Clarification']){
+    await expect(trends.getByText(label,{exact:true})).toBeVisible();
+  }
+  const breakdown=page.getByRole('region',{name:'Backlog Breakdown'});
+  await expect(breakdown.getByRole('listitem')).toHaveText([
+    /In-House Pending\s*47\s*\(65\.3%\)/,
+    /Vendor Pending\s*9\s*\(12\.5%\)/,
+    /Clarification\s*16\s*\(22\.2%\)/,
+  ]);
+  expect((await trends.boundingBox()).x).toBeLessThan((await breakdown.boundingBox()).x);
+  await trends.getByRole('button',{name:'01-10-26, In-House Pending: 42 orders',exact:true}).click();
+  const chartDialog=page.getByRole('dialog',{name:'Capacity orders · 01-10-26'});
+  await expect(chartDialog.locator('tbody tr')).toHaveCount(42);
+  await page.keyboard.press('Escape');
+  const pie=breakdown.locator('.capacity-pie-hit-area');
+  const pieBounds=await pie.boundingBox();
+  await page.mouse.click(pieBounds.x+pieBounds.width/2,pieBounds.y+pieBounds.height*.75);
+  const pieDialog=page.getByRole('dialog',{name:'Capacity orders · October 2026'});
+  await expect(pieDialog.locator('tbody tr')).toHaveCount(47);
+  await expect(pieDialog.getByRole('columnheader').nth(0)).toContainText('Order Number');
+  await expect(pieDialog.getByRole('columnheader').nth(1)).toContainText('Date');
+  await expect(pieDialog.getByRole('region',{name:'Daily capacity for October 2026'})).toHaveCount(0);
+  await expect(pieDialog.getByText(/matching records|Status groups contain/)).toHaveCount(0);
+  await page.keyboard.press('Escape');
   const dailyTotal=page.locator('.capacity-daily-total');
   await expect(dailyTotal.locator('td')).toHaveText(['Total','80','3','16','5','9','47','0','0']);
   await expect(page.locator('.capacity-total').first().locator('td')).toHaveText(['2026 YTD Total','87','3','16','5','9','47','0','0']);
@@ -242,11 +276,56 @@ test('capacity orders can edit status and completion date and show recorded fiel
   expect(errors).toEqual([]);
 });
 
-test('daily date opens the same detail table and stale edits keep their values for review',async({page})=>{
+test('monthly report keeps tables inside KPI popups and supports imported SLA bulk edits',async({page})=>{
+  await setup(page);
+  let rows=['MONTH-01','MONTH-02'].map(number=>({'Order Number':number,Status:'Completed and Delivered',
+    'Free Site':'On Time',_record_key:number,completion_date:'2026-10-01'}));
+  const month=()=>({Month:'2026-10',MonthLabel:'October 2026','Month Orders':2,'Completed Orders':2,
+    'SLA On Time':rows.filter(row=>row['Free Site']==='On Time').length,
+    'SLA Missed':rows.filter(row=>row['Free Site']==='Missing').length,
+    columns:['Order Number','Status','Free Site'],rows,sla_rows:rows});
+  await page.route('**/api/monthly-orders',route=>route.fulfill({json:{mode:'excel',rows:[month()]}}));
+  await page.route('**/api/sla-comments/bulk',route=>{
+    const body=route.request().postDataJSON();
+    expect(body.mode).toBe('excel');
+    expect(body.status).toBe('Missing');
+    expect(body.orders.map(order=>order.record_key)).toEqual(['MONTH-01','MONTH-02']);
+    rows=rows.map(row=>({...row,'Free Site':'Missing'}));
+    return route.fulfill({json:{rows:[month()],message:'2 SLA changes saved to the imported report.'}});
+  });
+  await page.getByRole('button',{name:'Monthly Orders',exact:true}).click();
+  await expect(page.getByRole('heading',{name:'SLA results',exact:true})).toBeVisible();
+  await expect(page.locator('.daily-orders').getByRole('table')).toHaveCount(0);
+  await expect(page.getByRole('region',{name:'Monthly orders bar chart'})).toHaveCount(0);
+  await page.locator('.sla-metrics').getByRole('button',{name:/^SLA On Time/}).click();
+  const sla=page.getByRole('dialog',{name:'SLA On Time · October 2026'});
+  await expect(sla.getByRole('cell',{name:'MONTH-01',exact:true})).toBeVisible();
+  await sla.getByRole('checkbox',{name:'Select all orders on this page'}).check();
+  await sla.getByLabel('Bulk SLA status').selectOption('Missing');
+  await sla.getByRole('button',{name:'Update 2 selected'}).click();
+  await expect(sla.getByRole('status')).toContainText('2 SLA changes saved');
+  await page.keyboard.press('Escape');
+  await page.locator('.sla-metrics').getByRole('button',{name:/^SLA Missed/}).click();
+  const missed=page.getByRole('dialog',{name:'SLA Missed · October 2026'});
+  await expect(missed.getByRole('checkbox',{name:'Select order MONTH-01'})).toBeEnabled();
+  await expect(missed.getByRole('button',{name:'Edit SLA for order MONTH-01'})).toBeEnabled();
+  await page.keyboard.press('Escape');
+  await page.locator('.metrics').getByRole('button',{name:/^Month Orders/}).click();
+  await expect(page.getByRole('dialog',{name:'Month Orders · October 2026'}).getByRole('cell',{name:'MONTH-01',exact:true})).toBeVisible();
+});
+
+test('daily calendar selects a date and KPI popup preserves stale edits for review',async({page})=>{
   const {fixture,errors}=await setup(page,{rejectSave:true});
   await page.getByRole('button',{name:'Daily Orders',exact:true}).click();
-  await page.getByRole('button',{name:'01-10-26',exact:true}).click();
-  const dialog=page.getByRole('dialog',{name:'Daily orders · 01-10-26'});
+  await page.getByRole('button',{name:'Daily orders date'}).click();
+  const calendar=page.getByRole('dialog',{name:'Choose a Daily Orders date'});
+  await calendar.getByRole('button',{name:'October 1, 2026',exact:true}).click();
+  await expect(calendar).toHaveCount(0);
+  await expect(page.locator('.daily-orders').getByRole('table')).toHaveCount(0);
+  await expect(page.getByRole('heading',{name:'Daily Orders by Date'})).toHaveCount(0);
+  await page.getByRole('button',{name:'Received 60',exact:true}).click();
+  const dialog=page.getByRole('dialog',{name:'Received · 01-10-26'});
+  await expect(dialog.getByRole('group',{name:'Order groups'})).toHaveCount(0);
   await expect(dialog.locator('tbody tr')).toHaveCount(50);
   await dialog.getByLabel('Search detail records').fill(fixture.rows[1]['Order Number']);
   await expect(dialog.locator('tbody tr')).toHaveCount(1);
@@ -266,7 +345,7 @@ test('an outdated server explains the missing route and both dialogs recover aft
   await setup(page,{legacyDetailsOnce:true});
   for(const view of ['Capacity Report','Daily Orders']){
     await page.getByRole('button',{name:view,exact:true}).click();
-    await page.getByRole('button',{name:'01-10-26',exact:true}).click();
+    await page.getByRole('button',{name:view==='Daily Orders'?'Received 60':'01-10-26',exact:true}).click();
     const dialog=page.getByRole('dialog');
     await expect(dialog.getByRole('alert')).toContainText('server needs a restart');
     await dialog.getByRole('button',{name:'Retry details',exact:true}).click();
@@ -282,7 +361,6 @@ test('report cards and tables have clear typography and states in light, dark an
   const metrics=page.locator('.daily-orders>.metrics');
   await expect(metrics.locator('button')).toHaveCount(8);
   expect(await metrics.evaluate(element=>getComputedStyle(element).gridTemplateColumns.split(' ').length)).toBe(4);
-  expect(await page.locator('.status-report-table td').first().evaluate(element=>getComputedStyle(element).fontFamily)).toContain('Segoe UI');
   await page.screenshot({path:'test-results/reports-refresh-light.png',fullPage:true});
   const toggle=page.getByRole('switch',{name:'Dark mode',exact:true});
   if((await toggle.getAttribute('aria-checked'))!=='true')await toggle.click();
@@ -291,8 +369,14 @@ test('report cards and tables have clear typography and states in light, dark an
   await page.screenshot({path:'test-results/reports-refresh-dark.png',fullPage:true});
   const received=metrics.getByRole('button',{name:'Received 60',exact:true});
   await received.click();
-  await expect(received).toHaveAttribute('aria-pressed','true');
-  await expect(page.locator('#daily-orders-group-0')).toBeFocused();
+  const dialog=page.getByRole('dialog',{name:'Received · 01-10-26'});
+  await expect(dialog).toBeVisible();
+  expect((await dialog.boundingBox()).width).toBeGreaterThan(1300);
+  await page.keyboard.press('Escape');
+  await metrics.getByRole('button',{name:'Completed 2',exact:true}).click();
+  const completed=page.getByRole('dialog',{name:'Completed · 01-10-26'});
+  await expect(completed).toBeVisible();
+  await page.keyboard.press('Escape');
   await page.setViewportSize({width:390,height:844});
   expect(await metrics.evaluate(element=>getComputedStyle(element).gridTemplateColumns.split(' ').length)).toBe(2);
   expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);

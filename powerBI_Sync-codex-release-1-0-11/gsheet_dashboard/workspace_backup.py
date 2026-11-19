@@ -10,7 +10,7 @@ import tempfile
 import zipfile
 
 SETTINGS = ('remaining_products.json', 'sync_schedule.json', 'production-cache.json')
-TABLES = {'previews', 'sla_corrections', 'sync_receipts', 'sync_jobs', 'sync_reports', 'sync_failures', 'operation_history', 'monthly_operations', 'report_workspace', 'import_excel_changes', 'capture_settings', 'sqlite_sequence'}
+TABLES = {'previews', 'sla_corrections', 'sync_receipts', 'sync_jobs', 'sync_reports', 'sync_failures', 'operation_history', 'monthly_operations', 'report_workspace', 'import_excel_changes', 'capture_settings', 'capture_reset_archive', 'sqlite_sequence'}
 
 
 def save_safety_backup(store, reason):

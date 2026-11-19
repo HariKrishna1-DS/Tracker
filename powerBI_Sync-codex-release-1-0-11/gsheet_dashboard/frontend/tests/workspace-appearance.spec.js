@@ -1,6 +1,52 @@
 import {test,expect} from '@playwright/test';
 import {workspaceFixture} from './workspace-fixture.js';
 
+test('bulk capture deletion requires confirmation and clears the library without reset controls',async({page})=>{
+  const fixture=workspaceFixture(12);
+  let reset=false;
+  let holdPoll=false;
+  let releasePoll, pollStarted;
+  const stalePoll=new Promise(resolve=>{releasePoll=resolve;});
+  const started=new Promise(resolve=>{pollStarted=resolve;});
+  await page.clock.install();
+  await page.route('**/api/**',async route=>{
+    const name=new URL(route.request().url()).pathname;
+    if(name==='/api/previews/batch-delete'){
+      reset=true;
+      return route.fulfill({json:{deleted:fixture.previews.map(preview=>preview.id),previews:[],pending_sync:0}});
+    }
+    const body=fixture.response(name);
+    if(name==='/api/state'&&holdPoll){
+      holdPoll=false;
+      pollStarted();
+      await stalePoll;
+      return route.fulfill({json:{...body,previews:fixture.previews}});
+    }
+    return route.fulfill({json:name==='/api/state'?{...body,previews:reset?[]:fixture.previews,
+      can_reset_previews:!reset,can_undo_preview_reset:reset}:body});
+  });
+  await page.goto('/');
+  await page.getByRole('button',{name:'Captures',exact:true}).click();
+  const library=page.getByRole('region',{name:'Saved capture library'});
+  await expect(library.getByRole('button',{name:'Reset previews',exact:true})).toHaveCount(0);
+  await library.getByRole('checkbox',{name:'Select all captures'}).check();
+  const deleteButton=library.getByRole('button',{name:`Delete (${fixture.previews.length})`,exact:true});
+  page.once('dialog',dialog=>dialog.dismiss());
+  await deleteButton.click();
+  await expect(library.locator('.capture-card')).toHaveCount(fixture.previews.length);
+  holdPoll=true;
+  await page.clock.fastForward(11000);
+  await started;
+  page.once('dialog',dialog=>dialog.accept());
+  await deleteButton.click();
+  await expect(library.locator('.capture-card')).toHaveCount(0);
+  const staleResponse=page.waitForResponse(response=>response.url().includes('/api/state?light=1'));
+  releasePoll();
+  await (await staleResponse).finished();
+  await expect(library.getByRole('button',{name:'Undo reset',exact:true})).toHaveCount(0);
+  await expect(library.locator('.capture-card')).toHaveCount(0);
+});
+
 for(const theme of ['light','dark'])test(`workspace appearance is consistent in ${theme} mode`,async({page})=>{
   const fixture=workspaceFixture(12),errors=[];
   fixture.rows[0].Status='Completed and Delivered';

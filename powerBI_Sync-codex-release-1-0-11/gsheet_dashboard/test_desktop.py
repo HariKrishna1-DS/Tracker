@@ -76,7 +76,7 @@ class DesktopTests(unittest.TestCase):
         store = PreviewStore(self.root / 'previews')
         first = store.save(pd.DataFrame([{'Order Number': '001'}]))
         with store.connect() as connection:
-            connection.execute('CREATE TABLE capture_settings (id INTEGER PRIMARY KEY, payload TEXT NOT NULL)')
+            connection.execute('CREATE TABLE IF NOT EXISTS capture_settings (id INTEGER PRIMARY KEY, payload TEXT NOT NULL)')
             connection.execute('INSERT INTO capture_settings VALUES (?,?)', (1, json.dumps({'auto_recover': False})))
         raw = make_backup(store).getvalue()
         store.save(pd.DataFrame([{'Order Number': '002'}]))
@@ -92,7 +92,7 @@ class DesktopTests(unittest.TestCase):
         store = PreviewStore(self.root / 'previews')
         first = store.save(pd.DataFrame([{'Order Number': 'SAFE'}]))
         with store.connect() as connection:
-            connection.execute('CREATE TABLE capture_settings (id INTEGER PRIMARY KEY, payload TEXT NOT NULL)')
+            connection.execute('CREATE TABLE IF NOT EXISTS capture_settings (id INTEGER PRIMARY KEY, payload TEXT NOT NULL)')
             connection.execute('INSERT INTO capture_settings VALUES (?,?)', (1, json.dumps({'auto_recover': 'false'})))
         raw = make_backup(store).getvalue()
         with self.assertRaisesRegex(ValueError, 'invalid capture recovery settings'):

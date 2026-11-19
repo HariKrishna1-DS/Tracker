@@ -21,7 +21,7 @@ test('batch report import, source switching, daily publication and capacity view
       if(name==='/api/report-import'){
         const data=route.request().postData();
         expect(data).toContain('one.csv');expect(data).toContain('two.csv');
-        mode='excel';body={mode,row_count:10,publication:{synced:true}};
+        mode='excel';body={mode,row_count:10,publication:{synced:false,sync_error:'Google Sheets quota exceeded'}};
       }
       if(name==='/api/daily-orders')body={rows:days,selected_date:selected,source:mode==='excel'?'Imported Excel':'Google Sheets'};
       if(name==='/api/daily-orders/details')body={date:url.searchParams.get('date'),mode,columns:fixture.columns,groups:[{key:'received',label:'Received',rows:fixture.rows}]};
@@ -40,20 +40,18 @@ test('batch report import, source switching, daily publication and capacity view
     {name:'two.csv',mimeType:'text/csv',buffer:Buffer.from('Order Number,Status,Product\n2,Assign to ABS,Full Search')}
   ]);
   await page.getByRole('button',{name:'Import and update reports'}).click();
-  await expect(page.getByText('Reports saved and Google Sheets updated.',{exact:true})).toBeVisible();
+  await expect(page.getByRole('dialog',{name:'Import Excel reports'})).toHaveCount(0);
   await expect(page.getByRole('button',{name:'Import Excel report',exact:true})).toHaveAttribute('aria-pressed','true');
-  await page.keyboard.press('Escape');
   await page.getByRole('button',{name:'Daily Orders',exact:true}).click();
-  await expect(page.getByRole('columnheader',{name:/^Vendor Pending/})).toBeVisible();
-  await expect(page.getByRole('option',{name:'01-10-26',exact:true})).toHaveAttribute('value','2026-10-01');
-  await page.getByRole('button',{name:'01-10-26',exact:true}).click();
+  await page.getByRole('button',{name:'Daily orders date'}).click();
+  await page.getByRole('button',{name:'October 1, 2026',exact:true}).click();
   await expect(page.getByText('01-10-26 is highlighted in Daily Status Report and filtered in All Products.')).toBeVisible();
-  await expect(page.getByRole('dialog',{name:'Daily orders · 01-10-26'})).toBeVisible();
-  await page.keyboard.press('Escape');
   await page.getByRole('button',{name:'Received 10',exact:true}).click();
-  await expect(page.locator('#daily-orders-group-0')).toBeFocused();
+  await expect(page.getByRole('dialog',{name:'Received · 01-10-26'})).toBeVisible();
+  await page.keyboard.press('Escape');
   await page.getByRole('button',{name:'Completed 2',exact:true}).click();
-  await expect(page.locator('#daily-orders-group-1')).toBeFocused();
+  await expect(page.getByRole('dialog',{name:'Completed · 01-10-26'})).toBeVisible();
+  await page.keyboard.press('Escape');
   await page.getByRole('button',{name:'Capacity Report',exact:true}).click();
   await expect(page.getByRole('heading',{name:'Daily capacity',exact:true})).toBeVisible({timeout:15000});
   await page.screenshot({path:'test-results/pdf-capacity-report.png',fullPage:true});

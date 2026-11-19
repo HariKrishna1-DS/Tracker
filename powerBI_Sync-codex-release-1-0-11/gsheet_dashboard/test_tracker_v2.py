@@ -271,6 +271,22 @@ class SheetTransactionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'older preview'):
             sync_trackers(self.frame(1, [{'Order Number': 'B', 'Product': 'Full Title'}]), book=self.book)
 
+    def test_restarted_local_numbers_keep_cloud_history_and_retry_safely(self):
+        store = PreviewStore(self.folder.name)
+        store.restore(2, ['Order Number', 'Product'], [{'Order Number': 'A', 'Product': 'Full Title'}])
+        sync_trackers(self.frame(2, [{'Order Number': 'A', 'Product': 'Full Title'}]), book=self.book)
+        store.delete(2)
+        rows = [{'Order Number': 'B', 'Product': 'Full Title'}]
+        saved = store.save(pd.DataFrame(rows))
+        self.assertEqual(saved['name'], 'preview1')
+        frame = self.frame(saved['id'], rows)
+        sync_trackers(frame, book=self.book)
+        sync_trackers(frame, book=self.book)
+        archive = records(self.book.worksheet('Sheet1').get_all_values())
+        self.assertEqual([(row['Preview'], row['Order Number']) for row in archive],
+                         [('preview2', 'A'), ('preview3', 'B')])
+        self.assertEqual(frame.attrs['pass_report']['preview_name'], 'preview1')
+
     def test_manual_formula_never_written_when_syncing_existing_order(self):
         frame = self.frame(1, [{'Order Number': 'BASE', 'Product': 'Full Title'}])
         sync_trackers(frame, book=self.book)
@@ -300,7 +316,7 @@ class AutomaticApiTests(unittest.TestCase):
             time.sleep(.02)
         self.fail('Automatic sync did not complete')
 
-    def test_import_syncs_without_click_and_waits_behind_another_sync(self):
+    def test_imports_remain_local_until_manual_sync_drains_them_in_order(self):
         from io import BytesIO
         from server import create_app
         entered, release = threading.Event(), threading.Event()
@@ -315,14 +331,20 @@ class AutomaticApiTests(unittest.TestCase):
         for name in ('A', 'B'):
             response = client.post('/api/import', data={'file': (BytesIO(f'Order Number,Product\n{name},Full Title\n'.encode()), 'queue.csv')})
             self.assertEqual(response.status_code, 201)
-            if name == 'A':
-                self.assertTrue(entered.wait(5))
+            self.assertEqual(calls, [])
         release.set()
+        client.post('/api/sheet-sync', json={'enabled': True})
+        self.assertEqual(client.post('/api/sync', json={'preview': client.get('/api/state').json['previews'][0]['id']}).status_code, 202)
         self.wait_synced(2)
+        # A sync receipt precedes the final journal write; wait before cleanup.
+        deadline = time.monotonic() + 5
+        while client.get('/api/health').json['running'] and time.monotonic() < deadline:
+            time.sleep(.01)
+        self.assertFalse(client.get('/api/health').json['running'])
         self.assertEqual(calls, [1, 2])
         self.assertEqual(len(self.store.list()), 2)
 
-    def test_manual_extraction_also_syncs_automatically(self):
+    def test_manual_extraction_waits_for_explicit_sheet_sync(self):
         from server import create_app
         calls = []
         def runner(on_progress):
@@ -330,6 +352,12 @@ class AutomaticApiTests(unittest.TestCase):
             return {'preview_id': preview['id'], 'preview_name': preview['name'], 'error': None}
         client = create_app(root=self.root, runner=runner, syncer=lambda frame: calls.append(frame.attrs['preview_id']) or [FULL]).test_client()
         self.assertEqual(client.post('/api/extract').status_code, 202)
+        for _ in range(400):
+            if not client.get('/api/health').json['running']: break
+            time.sleep(.01)
+        self.assertEqual(calls, [])
+        client.post('/api/sheet-sync', json={'enabled': True})
+        self.assertEqual(client.post('/api/sync', json={'preview': client.get('/api/state').json['previews'][0]['id']}).status_code, 202)
         self.wait_synced(1)
         for _ in range(400):
             if not client.get('/api/health').json['running']:

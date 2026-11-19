@@ -366,15 +366,27 @@ def build_sla_status(snapshot, as_of=None):
     sheets = snapshot.get('sheets', {})
     source = sheets.get('Overview') or sheets.get('All Products') or {'rows': [], 'columns': []}
 
-    # A saved queue describes its capture, not the day on which it is reopened.
-    captured_at = local_time(snapshot.get('updated_at'))
+    # Keep saved reports anchored to the capture, even when reopened later.
+    updated_at = snapshot.get('updated_at')
+    captured_at = local_time(updated_at)
     # Portal timestamps can be on the next calendar day at the capture boundary.
     # Ignore implausibly distant arrival dates and never consult today's date.
     portal_reference = reference if reference and (not captured_at or
         abs((reference.date() - captured_at.date()).days) <= 1) else None
+    capture_day_ist = None
+    if as_of is None and snapshot.get('report_scope') == 'preview' and updated_at:
+        try:
+            instant = datetime.fromisoformat(str(updated_at).replace('Z', '+00:00'))
+        except ValueError:
+            pass
+        else:
+            if instant.tzinfo is not None:
+                capture_day_ist = instant.astimezone(IST).date()
     if as_of is None:
         if snapshot.get('report_scope') == 'imported_date' and selected_day and selected_day != 'Undated':
             as_of = datetime.fromisoformat(selected_day)
+        elif capture_day_ist:
+            as_of = datetime.combine(capture_day_ist, datetime.min.time())
         else:
             as_of = portal_reference or captured_at or reference or datetime.now(PORTAL_TIMEZONE)
     if isinstance(as_of, date) and not isinstance(as_of, datetime):
@@ -383,8 +395,9 @@ def build_sla_status(snapshot, as_of=None):
         as_of = as_of.astimezone(PORTAL_TIMEZONE).replace(tzinfo=None)
     anchor = as_of if snapshot.get('report_scope') == 'imported_date' else (captured_at or as_of)
     if snapshot.get('report_scope') == 'preview':
-        # The captured positive countdown belongs to this queue's SLA day.
-        anchor = as_of.replace(hour=0, minute=0, second=0, microsecond=0)
+        # Relative deadlines still use the captured TitleVision queue clock.
+        queue_day = (portal_reference or captured_at or as_of) if capture_day_ist else as_of
+        anchor = queue_day.replace(hour=0, minute=0, second=0, microsecond=0)
     rows, excluded, counts = [], [], Counter()
     for original in source['rows']:
         if not str(original.get('Order Number') or '').strip():
@@ -424,7 +437,7 @@ def build_sla_status(snapshot, as_of=None):
                                   'Counted SLA': counted[number_key(row)]['SLA Category'],
                                   'Applied status condition': counted[number_key(row)].get('Status Reason', '')})
                       for row in snapshot.get('duplicate_rows') or []]
-    date_basis = 'selected_date' if selected_day and selected_day != 'Undated' else 'arrival_time' if portal_reference else 'capture_time'
+    date_basis = 'selected_date' if selected_day and selected_day != 'Undated' else 'capture_date_ist' if capture_day_ist else 'arrival_time' if portal_reference else 'capture_time'
     return {'as_of': as_of.date().isoformat(), 'date_basis': date_basis,
             'sla_reference_at': reference.isoformat() if reference else None, 'rows': rows, 'excluded_rows': excluded,
             'excluded_count': len(excluded), 'summary': summary, 'totals': totals,

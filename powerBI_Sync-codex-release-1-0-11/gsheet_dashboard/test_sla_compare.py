@@ -16,6 +16,39 @@ from sla_compare import (compare_sla_with_production, export_comparison_excel,
 
 
 class SlaCompareTests(unittest.TestCase):
+    def test_custom_status_is_retained_with_zero_counts_in_summary_and_download(self):
+        from sla_compare import recalculate_summary
+        self.report['custom_statuses']=['Manual review']
+        result=compare_sla_with_production(self.report,self.production)
+        recalculate_summary(result)
+        custom=next(row for row in result['sla_summary']['rows'] if row['Status']=='Manual review')
+        self.assertEqual(custom['Grand Total'],0)
+        self.assertEqual(result['sla_summary']['totals']['Grand Total'],3)
+        book=load_workbook(export_comparison_excel(result,table_scope='sla_summary'))
+        exported=next(row for row in book.active.iter_rows(min_row=5,values_only=True) if row[0]=='Manual review')
+        self.assertEqual(exported[-1],0)
+        book.close()
+
+    def test_summary_download_details_reconcile_with_every_matrix_cell(self):
+        from collections import Counter
+        self.report['rows'][0]['SLA Category']='Unknown SLA'
+        result=compare_sla_with_production(self.report,self.production)
+        book=load_workbook(export_comparison_excel(result,table_scope='sla_summary'))
+        self.assertEqual(book.sheetnames,['SLA Status Summary','Related Orders'])
+        sheet=book['Related Orders']
+        rows=list(sheet.values)
+        records=[dict(zip(rows[0],row)) for row in rows[1:]]
+        counts=Counter((row['Production Status'],row['SLA Category']) for row in records)
+        self.assertEqual(len(records),result['sla_summary']['totals']['Grand Total'])
+        for row in result['sla_summary']['rows']:
+            for category in ('Future SLA','Negative SLA','Today SLA','Unknown SLA'):
+                self.assertEqual(counts[(row['Status'],category)],row.get(category,0))
+        self.assertNotIn('PROD-ONLY',{row['Order Number'] for row in records})
+        self.assertNotIn('NEG-2',{row['Order Number'] for row in records})
+        self.assertEqual(sheet.freeze_panes,'C2')
+        self.assertTrue(sheet.auto_filter.ref)
+        book.close()
+
     def setUp(self):
         self.report = {'as_of': '2026-10-14', 'rows': [
             {'Order Number': number, 'Status': 'Search In Progress',
@@ -55,6 +88,33 @@ class SlaCompareTests(unittest.TestCase):
         self.assertEqual(order['change_label'], 'Unchanged')
         self.assertFalse(any(row['Status'] == 'Completed and Delivered' for row in result['sla_summary']['rows']))
         self.assertEqual(self.production[0]['status'], 'Completed and Delivered')
+
+    def test_assignment_pending_excel_status_is_preserved_and_not_moved(self):
+        from sla_compare import read_production_file, recalculate_summary
+        for status in ('Need to assign ABS','Need to Assign',' NEED TO ASSIGN ABS '):
+            with self.subTest(status=status):
+                parsed=read_production_file(('Order Number,Product,Status\nNEG-1,Full Title,'+status+'\n').encode(),filename='pending.csv')
+                self.assertEqual(parsed[0]['status'],status.strip())
+                result=compare_sla_with_production(self.report,parsed)
+                order=next(row for row in result['orders'] if row['order_number']=='NEG-1')
+                self.assertEqual(order['prod_status'],status.strip())
+                self.assertFalse(order['status_changed'])
+                self.assertEqual(order['match_type'],'same_status')
+                self.assertTrue(any(row['Status']==status.strip() for row in result['sla_summary']['rows']))
+                recalculate_summary(result)
+                self.assertEqual(order['prod_status'],status.strip())
+                self.assertFalse(order['status_changed'])
+
+    def test_unknown_sla_is_visible_and_summary_and_excel_totals_reconcile(self):
+        self.report['rows'][0]['SLA Category']='Unknown SLA'
+        result=compare_sla_with_production(self.report,self.production)
+        summary=result['sla_summary']
+        self.assertIn('Unknown SLA',summary['columns'])
+        for row in [*summary['rows'],summary['totals']]:
+            self.assertEqual(sum(row.get(c,0) for c in summary['columns'][1:-1]),row['Grand Total'])
+        book=load_workbook(export_comparison_excel(result,table_scope='sla_summary'))
+        self.assertIn('Unknown SLA',[cell.value for cell in book.active[4]])
+        book.close()
 
     def test_summary_keeps_the_original_queue_scope_and_columns(self):
         self.production[0]['status'] = 'Typing in Progress'

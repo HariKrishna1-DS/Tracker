@@ -15,10 +15,10 @@ from test_pdf_report_workspace import excel
 
 
 class RequestedReportUpdatesTests(unittest.TestCase):
-    def test_portal_capture_date_preserves_saved_deadlines_and_countdowns(self):
+    def test_india_capture_date_preserves_saved_portal_deadlines_and_countdowns(self):
         rows = [
             {'Order Number': 'latest', 'Arrival Time': '10/22/2026 10:47 PM', 'Task Status': 'Available',
-             'SLA Expiration*': '2026-10-22T23:59:00-07:00'},
+             'SLA Expiration*': '10/23 10:48 AM'},
             {'Order Number': 'older', 'Arrival Time': '10/21/2026 08:00 PM', 'Task Status': 'Available',
              'SLA Expiration*': '2026-10-21T23:59:00-07:00'},
             {'Order Number': 'countdown', 'Arrival Time': '10/20/2026 08:00 PM', 'Task Status': 'Available',
@@ -31,13 +31,14 @@ class RequestedReportUpdatesTests(unittest.TestCase):
             store.restore(1, list(rows[0]), rows, created='2026-10-22T20:00:00+00:00')
             snapshot = preview_snapshot(store)
             report = build_sla_status(snapshot)
-        self.assertEqual(report['as_of'], '2026-10-22')
-        self.assertEqual(report['date_basis'], 'arrival_time')
+        self.assertEqual(report['as_of'], '2026-10-23')
+        self.assertEqual(report['date_basis'], 'capture_date_ist')
         actual = {row['Order Number']: row for row in report['rows']}
         self.assertEqual(actual['latest']['SLA Category'], 'Today SLA')
+        self.assertEqual(actual['latest']['SLA Expiration'], '2026-10-23 10:48:00')
         self.assertEqual(actual['older']['SLA Category'], 'Negative SLA')
         self.assertEqual(actual['countdown']['SLA Expiration'], '2026-10-22 17:00:00')
-        self.assertEqual(actual['countdown']['SLA Category'], 'Today SLA')
+        self.assertEqual(actual['countdown']['SLA Category'], 'Negative SLA')
         self.assertEqual(rows, original)
 
     def test_removed_abs_status_merges_automatic_saved_and_custom_groups(self):

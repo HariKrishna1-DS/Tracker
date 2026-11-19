@@ -11,6 +11,13 @@ import pandas as pd
 
 IGNORED = {'Sync Timestamp', 'Queue Age Hours', 'Time Since Arrival', 'Task Time in Queue'}
 CHANGE_COLUMNS = ['Change', 'Task Key', 'Column', 'Previous Value', 'Latest Value']
+CAPTURE_TABLES = {
+    'previews': ('id', 'created', 'source', 'columns_json', 'rows_json'),
+    'sync_jobs': ('preview_id', 'state'),
+    'sync_reports': ('preview_id', 'sha256', 'report_json', 'committed'),
+    'sync_failures': ('preview_id', 'error', 'created'),
+    'sync_receipts': ('preview_id', 'report_json'),
+}
 
 
 class PreviewStore:
@@ -30,8 +37,87 @@ class PreviewStore:
             db.execute('CREATE TABLE IF NOT EXISTS sync_jobs (preview_id INTEGER PRIMARY KEY, state TEXT NOT NULL)')
             db.execute('CREATE TABLE IF NOT EXISTS sync_reports (preview_id INTEGER PRIMARY KEY, sha256 TEXT NOT NULL, report_json TEXT NOT NULL, committed INTEGER NOT NULL DEFAULT 0)')
             db.execute('CREATE TABLE IF NOT EXISTS sync_failures (preview_id INTEGER PRIMARY KEY, error TEXT NOT NULL, created TEXT NOT NULL)')
+            db.execute('CREATE TABLE IF NOT EXISTS capture_settings (id INTEGER PRIMARY KEY, payload TEXT NOT NULL)')
+            db.execute('CREATE TABLE IF NOT EXISTS capture_reset_archive (kind TEXT NOT NULL, payload TEXT NOT NULL)')
             # Upgrade v2.0 without re-uploading already committed snapshots.
             db.execute("INSERT OR IGNORE INTO sync_jobs SELECT preview_id, 'synced' FROM sync_receipts")
+
+    def auto_recover(self):
+        with self.connect() as db:
+            return self._auto_recover(db)
+
+    def _auto_recover(self, db):
+        row = db.execute('SELECT payload FROM capture_settings WHERE id=1').fetchone()
+        return not row or self.decode(row[0])['auto_recover']
+
+    def restarted_numbering(self):
+        with self.connect() as db:
+            row = db.execute('SELECT payload FROM capture_settings WHERE id=1').fetchone()
+            return bool(row and self.decode(row[0]).get('restarted_numbering'))
+
+    def recover_cloud_previews(self, previews):
+        """Apply a cloud history read only if local recovery is still allowed."""
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            if not self._auto_recover(db) or db.execute('SELECT 1 FROM previews LIMIT 1').fetchone():
+                return
+            for preview in previews:
+                number = preview['id']
+                db.execute('INSERT INTO previews(id,created,source,columns_json,rows_json) VALUES(?,?,?,?,?)',
+                           (number, preview['created'], preview['source'],
+                            json.dumps(preview['columns']), json.dumps(preview['rows'])))
+                db.execute("INSERT OR REPLACE INTO sync_jobs VALUES (?, 'synced')", (number,))
+                db.execute('DELETE FROM sync_failures WHERE preview_id=?', (number,))
+                db.execute('INSERT OR REPLACE INTO sync_receipts VALUES (?,?)', (number, '{"recovered": true}'))
+
+    def reset_status(self):
+        with self.connect() as db:
+            started = bool(db.execute("SELECT 1 FROM sqlite_sequence WHERE name='previews' AND seq>0").fetchone())
+            undo = not started and bool(db.execute("SELECT 1 FROM capture_reset_archive WHERE kind='reset'").fetchone())
+            return {'can_reset_previews': started, 'can_undo_preview_reset': undo}
+
+    def reset_previews(self):
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            ids = [row[0] for row in db.execute('SELECT id FROM previews')]
+            seq = db.execute("SELECT seq FROM sqlite_sequence WHERE name='previews'").fetchone()
+            if not seq or not seq[0]:
+                raise ValueError('Capture numbering is already reset.')
+            previous = db.execute('SELECT payload FROM capture_settings WHERE id=1').fetchone()
+            db.execute('DELETE FROM capture_reset_archive')
+            db.execute("INSERT INTO capture_reset_archive VALUES ('reset', ?)",
+                       (json.dumps([seq[0], previous[0] if previous else None]),))
+            for table, fields in CAPTURE_TABLES.items():
+                db.execute(f"INSERT INTO capture_reset_archive SELECT ?,json_array({','.join(fields)}) FROM {table}", (table,))
+                db.execute(f'DELETE FROM {table}')
+            db.execute("DELETE FROM sqlite_sequence WHERE name='previews'")
+            db.execute('INSERT OR REPLACE INTO capture_settings VALUES (1,?)', (json.dumps({'auto_recover': False}),))
+        for number in ids:
+            for suffix in ('csv', 'xlsx'):
+                try:
+                    (self.root / f'preview{number}.{suffix}').unlink(missing_ok=True)
+                except OSError:
+                    # Downloads use the database and will not expose an old export.
+                    pass
+        return len(ids)
+
+    def undo_preview_reset(self):
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            archive = db.execute("SELECT payload FROM capture_reset_archive WHERE kind='reset'").fetchone()
+            if not archive or db.execute("SELECT 1 FROM sqlite_sequence WHERE name='previews' AND seq>0").fetchone():
+                raise ValueError('Undo is available until the next capture is saved.')
+            sequence, settings = self.decode(archive[0])
+            for table, fields in CAPTURE_TABLES.items():
+                values = ','.join(f"json_extract(payload,'$[{i}]')" for i in range(len(fields)))
+                db.execute(f"INSERT INTO {table} ({','.join(fields)}) SELECT {values} FROM capture_reset_archive WHERE kind=?", (table,))
+            db.execute("DELETE FROM sqlite_sequence WHERE name='previews'")
+            db.execute("INSERT INTO sqlite_sequence VALUES ('previews',?)", (sequence,))
+            db.execute('DELETE FROM capture_settings WHERE id=1')
+            if settings:
+                db.execute('INSERT INTO capture_settings VALUES (1,?)', (settings,))
+            db.execute('DELETE FROM capture_reset_archive')
+            return db.execute('SELECT COUNT(*) FROM previews').fetchone()[0]
 
 
     @contextmanager
@@ -100,14 +186,31 @@ class PreviewStore:
         return (history, corrections) if include_sla_corrections else history
 
     def delete(self, number):
-        with self.connect() as db:
-            cursor = db.execute('DELETE FROM previews WHERE id=' + '?', (number,))
-            for table in ('sync_jobs', 'sync_reports', 'sync_failures', 'sync_receipts'):
-                db.execute(f'DELETE FROM {table} WHERE preview_id=?', (number,))
-        if not cursor.rowcount:
+        if not self.delete_many([number]):
             raise KeyError('Preview not found.')
-        for suffix in ('csv', 'xlsx'):
-            (self.root / f'preview{number}.{suffix}').unlink(missing_ok=True)
+
+    def delete_many(self, numbers):
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            deleted = sorted(set(numbers) & {row[0] for row in db.execute('SELECT id FROM previews')})
+            db.executemany('DELETE FROM previews WHERE id=?', ((number,) for number in deleted))
+            for table in CAPTURE_TABLES.keys() - {'previews'}:
+                db.executemany(f'DELETE FROM {table} WHERE preview_id=?', ((number,) for number in deleted))
+            if deleted and not db.execute('SELECT 1 FROM previews LIMIT 1').fetchone():
+                db.execute("DELETE FROM sqlite_sequence WHERE name='previews'")
+                db.execute('DELETE FROM capture_reset_archive')
+                for table in CAPTURE_TABLES.keys() - {'previews'}:
+                    db.execute(f'DELETE FROM {table} WHERE preview_id>0')
+                db.execute('INSERT OR REPLACE INTO capture_settings VALUES (1,?)',
+                           (json.dumps({'auto_recover': False, 'restarted_numbering': True}),))
+            for number in deleted:
+                for suffix in ('csv', 'xlsx'):
+                    try:
+                        (self.root / f'preview{number}.{suffix}').unlink(missing_ok=True)
+                    except OSError:
+                        # Downloads use the database; a new save replaces the export.
+                        pass
+        return deleted
 
     def sla_corrections(self):
         with self.connect() as db:

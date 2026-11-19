@@ -58,6 +58,32 @@ class SlaCommentsTests(unittest.TestCase):
         self.assertEqual(len(self.book.values_batch_update.call_args.args[0]['data']), 2)
         self.assertEqual(self.book.values_batch_get.call_args.args[0], [f"'{TRACKER_TITLES[0]}'!W2:W3"])
 
+    def test_imported_bulk_uses_record_identity_and_rejects_stale_selection(self):
+        from report_workspace import ReportWorkspace
+
+        base = {'Order Number': '001', 'Date': '10/01/2026', 'Product': 'Full Title',
+                'Status': 'Completed and Delivered', 'In-Time': '10/01/2026 09:00 AM',
+                'Out Time': '10/01/2026 12:00 PM', 'SLA Expiration': '10/01/2026 11:00 AM',
+                'Free Site': 'Missing', 'Source workbook': 'Full Search.xlsx'}
+        rows = [dict(base, **{'Source row ID': str(index)}) for index in range(3)]
+        workspace = ReportWorkspace(self.store)
+        workspace.save(mode='excel', imported={'rows': rows, 'files': [], 'columns': list(rows[0]), 'created': ''})
+        sla = self.report()['sla_rows']
+        self.assertEqual(len(sla), 3)
+        orders = [{'order_number': row['Order Number'], 'completion_date': row['completion_date'],
+                   'record_key': row['_record_key'], 'expected_status': 'Missing'} for row in sla[:2]]
+        request = {'mode': 'excel', 'orders': orders, 'status': 'On Time'}
+        invalid = [orders[0], dict(orders[1], record_key='stale')]
+        self.assertEqual(self.client.post('/api/sla-comments/bulk', json=dict(request, orders=invalid)).status_code, 409)
+        self.assertEqual(self.report()['SLA On Time'], 0)
+        result = self.client.post('/api/sla-comments/bulk', json=request)
+        self.assertEqual(result.status_code, 200, result.json)
+        self.assertEqual(result.json['updated_count'], 2)
+        self.assertEqual(self.report()['SLA On Time'], 2)
+        self.assertEqual(self.report()['SLA Missed'], 1)
+        self.assertEqual(self.client.post('/api/sla-comments/bulk', json=request).json['updated_count'], 0)
+        self.book.values_batch_update.assert_not_called()
+
     def test_missed_ui_value_uses_canonical_missing_in_sheet(self):
         response = self.save('002', 'Missed', 'On Time')
         self.assertEqual(response.status_code, 200)
@@ -102,6 +128,7 @@ class SlaCommentsTests(unittest.TestCase):
             release.wait(3)
             return []
         client = create_app(self.store.root, syncer=syncer).test_client()
+        client.post('/api/sheet-sync', json={'enabled': True})
         client.post('/api/sync', json={'preview': p['id']})
         self.assertTrue(entered.wait(2))
         self.assertEqual(client.post('/api/sla-comments', json={'order_number':'001','completion_date':'2026-09-30','status':'On Time','expected_status':'Missed'}).status_code, 409)

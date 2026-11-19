@@ -44,3 +44,24 @@
   .workspace .sla-controls-bar .sla-report-tools.has-repeated-orders { grid-template-columns:minmax(0,1fr); }
   .workspace .sla-controls-bar .has-repeated-orders>.report-order-search { grid-column:1; grid-row:2; }
 }
+
+.workspace .sla-status-workspace>.metrics{gap:16px}
+.workspace .sla-status-workspace>.metrics>.metric{min-height:128px;padding:20px 24px;border-radius:16px;display:flex;flex-direction:column;justify-content:center;align-items:flex-start;gap:10px;box-shadow:0 4px 14px #102a4308}
+.workspace .sla-status-workspace>.metrics>.metric>span{font-size:15px;line-height:1.5;font-weight:600}
+.workspace .sla-status-workspace>.metrics>.metric>strong{font-size:40px;line-height:1.15;font-weight:700;letter-spacing:-1px}
+.workspace .sla-status-workspace>.metrics>.metric:before{width:4px;top:20px;bottom:20px}
+.workspace .sla-status-workspace>.metrics>.metric:focus-visible{outline:3px solid var(--metric-accent,var(--focus));outline-offset:3px}
+.workspace .sla-status-workspace>.metrics>.metric,
+.workspace .sla-compare-workspace .compare-kpi {
+  --kpi-color:var(--metric-accent,var(--card-accent,var(--accent)));
+  background:linear-gradient(135deg,color-mix(in srgb,var(--kpi-color) 32%,var(--surface)) 0%,color-mix(in srgb,var(--kpi-color) 16%,var(--surface)) 48%,color-mix(in srgb,var(--kpi-color) 5%,var(--surface)) 100%);
+  border-color:color-mix(in srgb,var(--kpi-color) 35%,var(--line));
+}
+.workspace .sla-compare-workspace .compare-kpi.active {
+  border-color:var(--card-accent);
+  box-shadow:0 0 0 2px color-mix(in srgb,var(--card-accent) 25%,transparent),0 4px 14px #102a4308;
+}
+.workspace .sla-status-workspace>.metrics>.metric:hover,
+.workspace .sla-compare-workspace .compare-kpi:hover { border-color:var(--kpi-color); }
+.workspace .sla-compare-workspace .compare-kpi :is(.kpi-label,.kpi-tag) { color:var(--ink); }
+@media(max-width:700px){.workspace .sla-status-workspace>.metrics{gap:10px}.workspace .sla-status-workspace>.metrics>.metric{min-height:112px;padding:16px 18px}.workspace .sla-status-workspace>.metrics>.metric>strong{font-size:34px}.workspace .sla-status-workspace>.metrics>.metric>span{font-size:14px}}

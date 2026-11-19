@@ -251,6 +251,45 @@ class CapacityCalculationTests(unittest.TestCase):
             with self.subTest(original=original):
                 self.assertEqual(capacity_date(original),friday)
 
+    def test_november_weekend_completed_orders_count_on_friday_in_api_details_and_export(self):
+        from report_workspace import read_report_files
+        from test_pdf_report_workspace import excel
+        clock=patch('report_workspace.current_capacity_month',return_value='2026-11')
+        clock.start()
+        self.addCleanup(clock.stop)
+        rows=[order('Friday','Completed and Delivered',received='11/03/2026',completed='11/06/2026 03:15 PM'),
+              order('Saturday','Completed and Delivered',received='10/30/2026',completed='11/07/2026 05:08 AM'),
+              order('Sunday','Completed and Delivered',received='11/03/2026',completed='11/08/2026 09:37 AM'),
+              order('Monday','Completed and Delivered',received='11/03/2026',completed='11/09/2026 01:17 AM')]
+        imported=read_report_files([('full.xlsx',excel(rows))])
+        before=deepcopy(imported)
+        with tempfile.TemporaryDirectory() as folder:
+            workspace=ReportWorkspace(PreviewStore(Path(folder)/'previews'))
+            workspace.save(mode='excel',imported=imported)
+            app=Flask(__name__)
+            register_report_routes(app,workspace,threading.Lock(),lambda **kwargs:None,lambda:None,lambda:None)
+            client=app.test_client()
+            report=client.get('/api/capacity-report').json
+            self.assertEqual({day['Date']:day['Completed'] for day in report['daily']},
+                             {'2026-11-03':0,'2026-11-06':3,'2026-11-09':1})
+            self.assertEqual(sum(day['Completed'] for day in report['monthly']),4)
+            details=client.get('/api/capacity-report/details?date=2026-11-06').json
+            completed=next(group['rows'] for group in details['groups'] if group['key']=='completed')
+            self.assertEqual({row['Order Number'] for row in completed},{'Friday','Saturday','Sunday'})
+            self.assertEqual({row['Capacity date'] for row in completed},{'2026-11-06'})
+            self.assertEqual({row['Source completion date'] for row in completed},
+                             {'2026-11-06','2026-11-07','2026-11-08'})
+            self.assertEqual(next(row['Out Time'] for row in completed if row['Order Number']=='Saturday'),
+                             '11/07/2026 05:08 AM')
+            response=client.get('/api/export/report?sheet=PR%20Excel&month=2026-11')
+            self.assertEqual(response.status_code,200)
+            book=load_workbook(BytesIO(response.data),data_only=True)
+            daily={cells[0].value.date().isoformat():cells[2].value for cells in book['PR Excel'].iter_rows()
+                   if isinstance(cells[0].value,datetime) and cells[0].number_format=='dd-mm-yy'}
+            self.assertEqual(daily,{'2026-11-03':0,'2026-11-06':3,'2026-11-09':1})
+            book.close()
+        self.assertEqual(imported,before)
+
     def test_api_and_export_use_same_direct_receipt_and_completion_counts(self):
         rows=[order('A','Awaiting for Clarification'),order('B','Assign to ABS'),
               order('C','Completed and Delivered',completed='10/02/2026 10:00 AM'),

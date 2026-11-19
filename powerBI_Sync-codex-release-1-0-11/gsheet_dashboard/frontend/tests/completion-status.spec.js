@@ -18,6 +18,7 @@ test('Daily Orders and Missing Previews show completed status, Out Time and comp
       if(name==='/api/daily-orders')body={mode:'tracker',source:'Google Sheets',selected_date:'2026-10-05',rows:[{
         Date:'2026-10-05',Received:3,Completed:2,Clarification:0,Cancelled:0,'Vendor Pending':0,'In-House Pending':1,
         'SLA OnTime':0,Missing:0,columns,rows:fixture.rows,sla_rows:[],Previews:[]}]};
+      if(name==='/api/daily-orders/details')body={mode:'tracker',columns,groups:[{key:'received',label:'Received',rows:fixture.rows}]};
       if(name==='/api/compare')body={previous:'preview31',latest:'preview32',method:'Matched by Order Number',
         record_columns:[...new Set(['Comparison Status','Order Number','Status','Out Time',...columns])],matched_rows:[],
         unmatched_rows:[{...fixture.rows[2],'Comparison Status':'Missing'}],
@@ -30,18 +31,18 @@ test('Daily Orders and Missing Previews show completed status, Out Time and comp
   });
   await page.goto('http://127.0.0.1:8534/');
   await page.getByRole('button',{name:'Daily Orders',exact:true}).click();
-  const completed=page.locator('#daily-orders-group-1');
-  await expect(completed.getByRole('heading',{name:'Completed · 2',exact:true})).toBeVisible();
-  await expect(completed.getByRole('cell',{name:'Completed and Delivered',exact:true})).toHaveCount(2);
-  await expect(completed.getByRole('cell',{name:'10/05/2026 10:00:00 AM',exact:true})).toBeVisible();
+  const completed=page.getByRole('dialog',{name:'Completed · 05-10-26'});
   for(const theme of ['light','dark']){
     const toggle=page.getByRole('switch',{name:'Dark mode',exact:true});
     if((await toggle.getAttribute('aria-checked'))!==String(theme==='dark'))await toggle.click();
     await expect(page.locator('html')).toHaveAttribute('data-theme',theme);
+    await page.getByRole('button',{name:'Completed 2',exact:true}).click();
+    await expect(completed.getByRole('cell',{name:'Completed and Delivered',exact:true})).toHaveCount(2);
+    await expect(completed.getByRole('cell',{name:'10/05/2026 10:00:00 AM',exact:true})).toBeVisible();
     await expect(completed.locator('tbody tr').first().locator('td').first()).toHaveCSS('background-color','rgb(255, 255, 153)');
+    if(theme==='dark')await completed.screenshot({path:'test-results/completed-daily-orders.png',animations:'disabled'});
+    await page.keyboard.press('Escape');
   }
-  await completed.scrollIntoViewIfNeeded();
-  await page.screenshot({path:'test-results/completed-daily-orders.png',animations:'disabled'});
   await page.getByRole('button',{name:'Changes',exact:true}).click();
   await page.getByRole('button',{name:'Missing Previews 1',exact:true}).click();
   const missing=page.locator('#changes-orders-group-missing');
