@@ -77,7 +77,6 @@ const {once} = require('node:events');
       await page.reload();
     };
     const portalNow=new Intl.DateTimeFormat('sv-SE',{timeZone:'America/Los_Angeles',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hourCycle:'h23'}).format(new Date());
-    const portalDay=portalNow.slice(0,10);
     await importCapture(`Order Number,Task Status,Product,SLA Expiration*,ETA Comments,Arrival Time\nDESKTOP-001,Available,Full Title,1d,Assigned to the abstractor,${portalNow}\n`);
     await page.getByLabel('SLA preview',{exact:true}).locator('option').filter({hasText:'preview1'}).waitFor({state:'attached',timeout:15000});
     await page.getByRole('button',{name:'Captures',exact:true}).click();
@@ -85,8 +84,11 @@ const {once} = require('node:events');
     await page.getByRole('cell',{name:'DESKTOP-001',exact:true}).first().waitFor();
     const etaSla=await page.evaluate(()=>fetch('/api/sla-status').then(response=>response.json()));
     assert.equal(etaSla.rows.find(row=>row['Order Number']==='DESKTOP-001')?.Status,'Assign to ABS');
-    assert.equal(etaSla.as_of,portalDay);
-    assert.equal(etaSla.date_basis,'arrival_time');
+    const captured=etaSla.previews.find(preview=>preview.id===etaSla.preview_id);
+    assert.ok(captured?.created,'The selected SLA preview must report its capture time');
+    const captureDay=new Intl.DateTimeFormat('sv-SE',{timeZone:'Asia/Kolkata',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date(captured.created));
+    assert.equal(etaSla.as_of,captureDay);
+    assert.equal(etaSla.date_basis,'capture_date_ist');
     assert.equal(etaSla.summary.some(row=>['Need to Assign ABS','Completed and Delivered'].includes(row.Status)),false);
     // Exercise the real packaged UI and engine together. A mocked browser
     // fixture alone cannot detect packaging an older local application.
@@ -223,7 +225,7 @@ const {once} = require('node:events');
     closing=app.waitForEvent('close',{timeout:15000});
     await app.evaluate(({Menu})=>Menu.getApplicationMenu().items[0].submenu.items.find(item=>item.label==='Quit Tv Tracker').click());
     await closing;app=null;
-    const result={passed:true,packaged:!!process.env.DESKTOP_EXE,startupMs,...metrics,idleElectronCpuPercent:idleCpuPercent,rendererErrors:errors,checks:['first launch','authenticated loopback','renderer isolation','update IPC and settings tab','keyboard navigation','DPAPI vault','settings restart','local import','saved captures','Arrival Time report date and merged ABS assignment','Excel capacity source isolation','SLA order search','manual SLA status creation','manual SLA order move with stable totals','report column filters','Excel manual SLA statuses','Excel workbook order move','Excel manual order creation','backup export','backup restore','single instance','clean shutdown','data persistence','safe diagnostics','theme persistence','table layout persistence','production workbook browser handoff']};
+    const result={passed:true,packaged:!!process.env.DESKTOP_EXE,startupMs,...metrics,idleElectronCpuPercent:idleCpuPercent,rendererErrors:errors,checks:['first launch','authenticated loopback','renderer isolation','update IPC and settings tab','keyboard navigation','DPAPI vault','settings restart','local import','saved captures','IST capture date and merged ABS assignment','Excel capacity source isolation','SLA order search','manual SLA status creation','manual SLA order move with stable totals','report column filters','Excel manual SLA statuses','Excel workbook order move','Excel manual order creation','backup export','backup restore','single instance','clean shutdown','data persistence','safe diagnostics','theme persistence','table layout persistence','production workbook browser handoff']};
     fs.writeFileSync(path.join(output,process.env.DESKTOP_EXE?'packaged-smoke.json':'development-smoke.json'),JSON.stringify(result,null,2));
     console.log(JSON.stringify(result,null,2));
   } catch(error) {
