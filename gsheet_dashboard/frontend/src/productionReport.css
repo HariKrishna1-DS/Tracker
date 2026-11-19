@@ -179,11 +179,10 @@
 }
 .production-report-files .production-order-actions .production-order-count:not(.is-excluded):hover:not(:disabled) { border-color:var(--accent); }
 .production-export-switches button[aria-checked='false'],
-.production-report-files .production-order-actions .production-order-count.is-excluded { background:linear-gradient(135deg,#f7b4bb 0%,#fbd4d8 45%,#fff1f2 100%); border-color:#e99aa5; color:#963342; }
-.production-export-switches button[aria-checked='false'] { box-shadow:inset 0 3px 0 #d96573; }
-.production-export-switches button[aria-checked='false'] .production-switch-track { background:#ffe0e4; border-color:#f4b4bb; color:#a52b39; }
+.production-report-files .production-order-actions .production-order-count.is-excluded { background:linear-gradient(135deg,#d3c2ee 0%,#e6dcf7 48%,#f5f3ff 100%); border-color:#c6b2e4; color:#5b4285; }
+.production-export-switches button[aria-checked='false'] .production-switch-track { background:#6d5199; border-color:#6d5199; color:#fff; }
 .production-report-files .production-order-count.is-excluded .production-metric-label,
 .production-report-files .production-order-count.is-excluded .production-category-state,
-.workspace .production-report-files .production-order-count.is-excluded strong { color:#963342; }
+.workspace .production-report-files .production-order-count.is-excluded strong { color:#5b4285; }
 .production-export-switches button[aria-checked='false']:hover:not(:disabled),
-.production-report-files .production-order-count.is-excluded:hover:not(:disabled) { border-color:#d96573; box-shadow:0 3px 10px #a52b3914; }
+.production-report-files .production-order-count.is-excluded:hover:not(:disabled) { border-color:#6d5199; box-shadow:0 3px 10px #5b428514; }

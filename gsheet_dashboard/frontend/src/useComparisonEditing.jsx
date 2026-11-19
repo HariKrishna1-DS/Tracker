@@ -1,5 +1,5 @@
 import React, {useEffect, useState} from 'react';
-import {Copy, Pencil, Plus} from 'lucide-react';
+import {Copy, Pencil, Plus, Trash2} from 'lucide-react';
 import {api} from './workspaceUtils';
 import {Dialog} from './DesktopExperience';
 import SlaOrderEditor, {StatusPicker} from './SlaOrderEditor';
@@ -63,9 +63,10 @@ export default function useComparisonEditing({previewId, orders, summaryStatus, 
       await onRefresh().catch(() => {});
     } finally { setSaving(false); }
   }
-  function statusActions(status) {
+  function statusActions(status, onRemove) {
     return <span className="inline compare-status-actions">
       <button type="button" className="icon-button" aria-label={`Add order to status ${status}`} title="Add SLA order" disabled={!ready || saving} onClick={() => addOrder(status)}><Plus size={15}/></button>
+      {onRemove&&<button type="button" className="icon-button" aria-label="Remove Cancelled from summary" title="Remove Cancelled from summary" onClick={onRemove}><Trash2 size={15}/></button>}
       <button type="button" className="icon-button" aria-label={`Edit status ${status}`} title="Edit comparison status name" disabled={!ready || saving} onClick={() => editStatus(status)}><Pencil size={15}/></button>
     </span>;
   }

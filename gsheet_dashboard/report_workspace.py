@@ -1678,6 +1678,7 @@ def register_report_routes(app, workspace, gate, load_snapshot, get_book, invali
             from_status=from_status,
             to_status=to_status,
             search=search,
+            exclude_cancelled=request.args.get('exclude_cancelled') == '1',
         )
         preview_label = res.get('preview_name', 'sla').replace(' ', '_')
         if table_scope == 'sla_summary':

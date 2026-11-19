@@ -35,6 +35,54 @@ class PreviewTests(unittest.TestCase):
             self.assertTrue((self.root / 'previews' / f'preview{number}.xlsx').exists())
         self.assertEqual(self.store.get(1)['rows'][0]['OPON'], '0001')
 
+    def test_reset_and_undo_restore_history_and_numbering(self):
+        self.store.save(self.frame())
+        self.store.save(self.frame('Completed'))
+        self.store.mark_synced(1, {'recovered': True})
+        cloud_history = self.store.history()
+        client = create_app(self.store.root, syncer=Mock(return_value=[])).test_client()
+        reset = client.post('/api/previews/reset')
+        self.assertEqual(reset.status_code, 200, reset.json)
+        self.assertEqual(reset.json['deleted'], 2)
+        state = client.get('/api/state?light=1').json
+        self.assertEqual(state['previews'], [])
+        self.assertTrue(state['can_undo_preview_reset'])
+        self.assertFalse(self.store.auto_recover())
+        # A cloud read that started before reset must not put those rows back.
+        self.store.recover_cloud_previews(cloud_history)
+        self.assertEqual(self.store.list(), [])
+        self.assertFalse((self.store.root / 'preview1.xlsx').exists())
+        self.assertEqual(client.post('/api/previews/reset/undo').json['restored'], 2)
+        self.assertEqual(self.store.unsynced_ids(), [2])
+        self.assertEqual(self.store.get(2)['rows'][0]['Task Status'], 'Completed')
+        self.assertEqual(client.get('/api/previews/2/download/xlsx').status_code, 200)
+        self.assertTrue(self.store.auto_recover())
+        self.assertEqual(self.store.save(self.frame())['name'], 'preview3')
+        self.assertEqual(client.post('/api/previews/reset').json['deleted'], 3)
+        self.assertEqual(self.store.save(self.frame())['name'], 'preview1')
+        self.assertEqual(client.post('/api/previews/reset/undo').status_code, 409)
+        self.assertEqual([row['id'] for row in self.store.list()], [1])
+
+    def test_deleting_all_captures_prevents_cloud_recovery(self):
+        for _ in range(3):
+            self.store.save(self.frame())
+        history = self.store.history()
+        client = create_app(self.store.root, syncer=Mock(return_value=[])).test_client()
+        partial = client.post('/api/previews/batch-delete', json={'ids': [1]}).json
+        self.assertEqual([preview['id'] for preview in partial['previews']], [3, 2])
+        deleted = client.post('/api/previews/batch-delete', json={'ids': [2, 3]}).json
+        self.assertFalse(deleted['can_undo_preview_reset'])
+        self.assertEqual(deleted['previews'], [])
+        self.store.recover_cloud_previews(history)
+        self.assertEqual(self.store.list(), [])
+        self.assertEqual(self.store.save(self.frame())['id'], 1)
+        self.assertEqual(self.store.save(self.frame())['id'], 2)
+        self.assertEqual(client.delete('/api/previews/2').status_code, 200)
+        final = client.delete('/api/previews/1').json
+        self.assertFalse(final['can_undo_preview_reset'])
+        self.assertEqual(self.store.list(), [])
+        self.assertEqual(self.store.save(self.frame())['id'], 1)
+
     def test_changed_added_removed_and_ignored_clock(self):
         a = self.store.save(pd.concat([self.frame(), self.frame().assign(OPON='2')]))
         b = self.store.save(pd.concat([self.frame('Completed').assign(**{'Time Since Arrival': '2h 0m'}), self.frame().assign(OPON='3')]))

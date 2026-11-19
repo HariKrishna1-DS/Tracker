@@ -27,9 +27,9 @@ test('saved preview controls daily history and monthly SLA percentages render', 
   await expect(page.getByText('Indian Standard Time (UTC+05:30)',{exact:true})).toBeVisible();
   await page.locator('.sync-schedule summary').click();
   await page.getByRole('button',{name:'Daily Orders',exact:true}).click();
-  await expect(page.getByLabel('Daily orders date')).toHaveValue('2026-09-30');
+  await expect(page.getByLabel('Daily orders date')).toHaveText('30-09-26');
   await page.locator('.preview-select').filter({hasText:'preview1'}).click();
-  await expect(page.getByLabel('Daily orders date')).toHaveValue('2026-09-29');
+  await expect(page.getByLabel('Daily orders date')).toHaveText('29-09-26');
   await page.getByRole('button',{name:'Monthly Orders',exact:true}).click();
   await expect(page.getByRole('heading',{name:'SLA COMMENTS'})).toBeVisible();
   await expect(page.locator('.metric').filter({hasText:'SLA On Time'})).toContainText('75.0%');

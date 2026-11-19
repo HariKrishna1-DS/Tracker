@@ -110,6 +110,7 @@ test('Negative SLA popup retains the SLA Status order set after production statu
     {order_number: 'TODAY', match_type: 'same_status', sla_category: 'Today SLA', sla_status: 'QC in Progress', prod_status: 'QC in Progress', sla_expiration: '1d'},
     {order_number: 'PROD-ONLY', match_type: 'prod_only', sla_category: 'Not in SLA Queue', sla_status: 'Not in SLA Queue', prod_status: 'QC in Progress', sla_expiration: ''},
     {order_number: 'HOME-1', match_type: 'sla_only', sla_category: 'Future SLA', sla_status: 'Home Builders', prod_status: 'Home Builders', sla_expiration: '2030-06-15 14:30:00'},
+    {order_number: 'CANCEL-1', match_type: 'same_status', sla_category: 'Unknown SLA', sla_status: 'Cancelled', prod_status: 'Cancelled'},
   ];
   await page.route('**/api/**', async route => {
     const name = new URL(route.request().url()).pathname;
@@ -120,8 +121,9 @@ test('Negative SLA popup retains the SLA Status order set after production statu
       source_files: 'production.xlsx', metrics: {total_sla: 3, total_production: 3, matched: 2, status_moved: 1, same_status: 1, sla_only: 1, prod_only: 1},
       transitions: [], sla_summary: {
         rows: [{Status: 'QC in Progress', 'Negative SLA': 1, 'Today SLA': 1, 'Grand Total': 2},
-          {Status: 'Home Builders', 'Future SLA': 1, 'Grand Total': 1}],
-        totals: {'Negative SLA': 1, 'Today SLA': 1, 'Future SLA': 1, 'Grand Total': 3},
+          {Status: 'Home Builders', 'Future SLA': 1, 'Grand Total': 1},
+          {Status: 'Cancelled', 'Unknown SLA': 1, 'Grand Total': 1}],
+        totals: {'Negative SLA': 1, 'Today SLA': 1, 'Future SLA': 1, 'Unknown SLA': 1, 'Grand Total': 4},
       },
     };
     if (name === '/api/sla-compare/update-status') body = {ok: true};
@@ -129,6 +131,15 @@ test('Negative SLA popup retains the SLA Status order set after production statu
   });
   await page.goto('/');
   await page.getByRole('button', {name: 'SLA Compare', exact: true}).click();
+  const matrix=page.getByRole('table', {name:'SLA Status Summary Table'});
+  const cancelled=matrix.getByRole('rowheader', {name:/Cancelled/});
+  const removeCancelled=cancelled.getByRole('button',{name:'Remove Cancelled from summary'});
+  await expect(removeCancelled).toBeVisible();
+  expect(await removeCancelled.evaluate(button=>button.previousElementSibling?.getAttribute('aria-label'))).toBe('Add order to status Cancelled');
+  await removeCancelled.click();
+  await expect(matrix.getByRole('rowheader', {name:/Cancelled/})).toHaveCount(0);
+  await expect(matrix.locator('.matrix-total-row td').last()).toHaveText('3');
+  await expect(page.getByRole('link', {name:'Download Summary (Excel)'})).toHaveAttribute('href', /exclude_cancelled=1/);
   const negative = page.getByTitle('Click to open Pop Table for all Negative SLA orders', {exact: true});
   await expect(negative).toHaveText('1');
   await negative.click();

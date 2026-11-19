@@ -3,8 +3,9 @@ import {FilterableTable,useColumnFilters} from './ColumnFilters';
 import React, { useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { Activity, ArrowDown, ArrowUp, ArrowDownToLine, ArrowLeftRight, BarChart3, CalendarDays, Check, ChevronLeft, ChevronRight, Clock3, CloudUpload, Database, FileSpreadsheet, Filter, HardDrive, LoaderCircle, Maximize2, Minimize2, Play, Plus, Printer, Search, SlidersHorizontal, Table2, Trash2, Upload, X } from 'lucide-react';
-import { ResponsiveContainer, LabelList, BarChart, Bar, LineChart, Line, AreaChart, Area, PieChart, Pie, Cell, XAxis, YAxis, CartesianGrid, Tooltip, Brush } from 'recharts';
+import { ResponsiveContainer, BarChart, Bar, LineChart, Line, AreaChart, Area, PieChart, Pie, Cell, XAxis, YAxis, CartesianGrid, Tooltip, Brush } from 'recharts';
 import {Dialog, OfflineNotice} from './DesktopExperience';
+import DismissibleNotice from './DismissibleNotice';
 import {MonthlyDownload, MonthlyMaintenance} from './MonthlyMaintenance';
 import remainingProducts from '../../remaining_products.json';
 const DateOrdersDialog=React.lazy(()=>import('./DateOrdersDialog'));
@@ -480,89 +481,70 @@ const DAILY_SERIES = [
 ];
 const DAILY_TONES = ['blue','green','amber','gray','purple','blue','green','red'];
 
-function PeriodOrdersChart({history, selected, onSelect, period, series, title, label: chartLabel}) {
-  const [expanded,setExpanded]=useState(false);
-  const sorted=useMemo(()=>[...history].sort((a,b)=>a[period].localeCompare(b[period])),[history,period]);
-  const selectedIndex=Math.max(0,sorted.findIndex(item=>item[period]===selected));
-  const start=Math.max(0,Math.min(selectedIndex-2,sorted.length-3));
-  const data=sorted.slice(start,start+3);
-  const formatPeriod=value=>{
-    const date=new Date(period==='Date'?`${value}T12:00:00`:`${value}-01T12:00:00`);
-    return Number.isNaN(date.getTime())?value:date.toLocaleDateString('en-US',period==='Date'?{month:'short',day:'numeric'}:{month:'short',year:'numeric'});
-  };
-  const renderChart=(large=false)=><>
-    <div className="chart-period-controls">
-      <button className="secondary" disabled={start===0} onClick={()=>onSelect(sorted[Math.max(0,start-1)][period])}><ChevronLeft size={15}/>Earlier</button>
-      <span>{data.length?`${formatPeriod(data[0][period])} – ${formatPeriod(data.at(-1)[period])}`:''}</span>
-      <button className="secondary" disabled={start+3>=sorted.length} onClick={()=>onSelect(sorted[Math.min(sorted.length-1,start+5)][period])}>Later<ChevronRight size={15}/></button>
-    </div>
-    <div className="daily-chart-legend">{series.map(item=><span key={item.name}><i style={{background:item.color}}/>{item.name}</span>)}</div>
-    <div className="daily-chart-scroll"><div style={{height:large?460:340,minWidth:Math.max(620,data.length*series.length*48)}}>
-      <ResponsiveContainer width="100%" height="100%">
-        <BarChart data={data} margin={{top:32,right:24,bottom:12,left:4}} barGap={5} barCategoryGap="12%">
-          <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="var(--chart-grid)"/>
-          <XAxis dataKey={period} tick={{fontSize:12}} tickFormatter={formatPeriod} interval={0}/>
-          <YAxis allowDecimals={false} tick={{fontSize:12}} width={52} domain={[0,max=>Math.max(5,Math.ceil(max*1.15))]}/>
-          <Tooltip cursor={{fill:'#f0f5f3'}} formatter={(value,name,item)=>period==='Month'?`${Number(value).toLocaleString()} (${monthlyPercentage(item.payload,name)})`:Number(value).toLocaleString()}/>
-          {series.map(item=><Bar key={item.name} dataKey={item.name} fill={item.color} radius={[3,3,0,0]} maxBarSize={40} minPointSize={value=>Number(value)>0?3:0} isAnimationActive={false} cursor="pointer" onClick={entry=>onSelect(entry[period]||entry.payload?.[period])}>
-            {data.map(row=><Cell key={row[period]} fillOpacity={row[period]===selected?1:0.8}/>)}
-            <LabelList dataKey={item.name} position="top" fill="#233b37" fontSize={11} fontWeight={600} formatter={value=>Number(value)>0?Number(value).toLocaleString():''}/>
-          </Bar>)}
-        </BarChart>
-      </ResponsiveContainer>
-    </div></div>
-    <p className="chart-hint">Values appear above each bar. Zero values have no bar. Select a bar or use Earlier / Later to change the period.</p>
-  </>;
-  return <section className="daily-chart" aria-label={chartLabel}>
-    <div className="card-head"><h3>{title}</h3><IconButton title={`Expand ${chartLabel.toLowerCase()}`} onClick={()=>setExpanded(true)}><Maximize2 size={16}/></IconButton></div>
-    {data.length?renderChart():<div className="table-empty">No orders</div>}
-    {expanded&&<MaximizedModal title={title} onClose={()=>setExpanded(false)}>{renderChart(true)}</MaximizedModal>}
-  </section>;
-}
-function DailyOrdersChart({history, selectedDate, onSelect, series=DAILY_SERIES}) {
-  return <PeriodOrdersChart history={history} selected={selectedDate} onSelect={onSelect} period="Date" series={series} title="Daily Orders by Date" label="Daily orders bar chart"/>;
-}
-
-function ImportedStatusSummary({report}) {
-  const counts=report?.status_counts;
-  if(!counts)return null;
-  return <section className="status-report"><div className="section-heading"><h3>All imported statuses</h3><span>{Object.keys(counts).length} statuses / {report.Received} orders</span></div><div className="status-report-scroll"><FilterableTable className="status-report-table"><thead><tr><th>Status</th><th>Orders</th><th>Share</th></tr></thead><tbody>{Object.entries(counts).map(([name,count])=><tr key={name}><td><span className="report-status-name"><i style={{background:statusColor(name)}}/>{name}</span></td><td>{count.toLocaleString()}</td><td>{report.Received?(count/report.Received*100).toFixed(1):'0.0'}%</td></tr>)}</tbody></FilterableTable></div></section>;
-}
-const importedSeries=snapshot=>(snapshot?.statuses||[]).map(name=>({name:'Status: '+name,color:statusColor(name)}));
 const dailyDateLabel=value=>/^\d{4}-\d{2}-\d{2}$/.test(str(value))?`${value.slice(8,10)}-${value.slice(5,7)}-${value.slice(2,4)}`:str(value);
 
+const calendarMonthLabel=new Intl.DateTimeFormat('en',{month:'short',year:'numeric',timeZone:'UTC'});
+const calendarDayLabel=new Intl.DateTimeFormat('en',{dateStyle:'long',timeZone:'UTC'});
+
+function DailyOrdersCalendar({history,selected,onSelect,onClose}) {
+  const [month,setMonth]=useState(()=>new Date(`${selected.slice(0,7)}-01T00:00:00Z`));
+  const year=month.getUTCFullYear(), index=month.getUTCMonth();
+  const dates=history.map(day=>day.Date).sort();
+  const available=new Set(dates);
+  const monthKey=month.toISOString().slice(0,7);
+  const cells=Array.from({length:42},(_,i)=>new Date(Date.UTC(year,index,1-month.getUTCDay()+i)));
+  const move=offset=>setMonth(new Date(Date.UTC(year,index+offset,1)));
+  return <Dialog title="Choose a Daily Orders date" onClose={onClose} className="daily-date-calendar">
+    <div className="dialog-content">
+      <div className="daily-calendar-nav">
+        <button type="button" className="icon-button" aria-label="Previous month" disabled={monthKey<=dates[0].slice(0,7)} onClick={()=>move(-1)}><ChevronLeft size={18}/></button>
+        <strong aria-live="polite">{calendarMonthLabel.format(month)}</strong>
+        <button type="button" className="icon-button" aria-label="Next month" disabled={monthKey>=dates.at(-1).slice(0,7)} onClick={()=>move(1)}><ChevronRight size={18}/></button>
+      </div>
+      <div className="daily-calendar-grid">
+        {['Sun','Mon','Tue','Wed','Thu','Fri','Sat'].map(day=><span key={day}>{day}</span>)}
+        {cells.map(day=>{
+          const key=day.toISOString().slice(0,10);
+          return <button type="button" key={key} aria-label={calendarDayLabel.format(day)} aria-pressed={key===selected}
+            disabled={day.getUTCMonth()!==index||!available.has(key)} onClick={()=>onSelect(key)}>{day.getUTCDate()}</button>;
+        })}
+      </div>
+    </div>
+  </Dialog>;
+}
+
 function DailyOrders({preview, running, revision}) {
-  const [history,setHistory]=useState([]), [error,setError]=useState(''), [date,setDate]=useState(''), [search,setSearch]=useState('');
+  const [history,setHistory]=useState([]), [error,setError]=useState(''), [date,setDate]=useState('');
+  const [publishError,setPublishError]=useState(null);
   const [loading,setLoading]=useState(true), [snapshot,setSnapshot]=useState(null), [publishing,setPublishing]=useState(false), [publishMessage,setPublishMessage]=useState('');
   const [highlight,setHighlight]=useState(null);
-  const [detailDate,setDetailDate]=useState(null),[historyRefresh,setHistoryRefresh]=useState(0);
+  const [calendarOpen,setCalendarOpen]=useState(false),[historyRefresh,setHistoryRefresh]=useState(0);
   const [activeGroup,setActiveGroup]=useState(null);
   useEffect(()=>{let active=true;setLoading(true);api(`/api/daily-orders${preview.id?`?preview_id=${preview.id}`:''}`).then(data=>{if(active){setHistory(data.rows);setSnapshot(data);setHighlight(data);setDate(current=>data.rows.some(row=>row.Date===current)?current:data.selected_date||'');setError('');}}).catch(e=>{if(active){setHistory([]);setError(e.message);}}).finally(()=>{if(active)setLoading(false);});return()=>{active=false;};},[preview.id,running,historyRefresh,revision]);
   useEffect(()=>{
     if(!highlight)return;
+    setPublishError(null);
     const selected=highlight.selected_date||'';
     if(highlight.publication_state==='synced'&&(highlight.highlighted_date||'')===selected){setPublishMessage(selected?`${dailyDateLabel(selected)} is highlighted in Daily Status Report and filtered in All Products.`:'Daily Status Report highlight cleared; All Products shows every order.');return;}
-    if(highlight.publication_state==='error'){setError(`Google Sheets date update needs retry: ${highlight.sync_error}`);return;}
+    if(highlight.publication_state==='error'){setPublishMessage('');setPublishError({date:selected,message:highlight.sync_error});return;}
     if(!['pending','working'].includes(highlight.publication_state))return;
     setPublishMessage(selected?`Updating Google Sheets for ${dailyDateLabel(selected)}…`:'Restoring all orders in Google Sheets…');
     let active=true;
-    const timer=setTimeout(()=>api('/api/report-workspace').then(data=>{if(active)setHighlight(data);}).catch(e=>{if(active)setError(e.message);}),2000);
+    const timer=setTimeout(()=>api('/api/report-workspace').then(data=>{if(active)setHighlight(data);}).catch(e=>{if(active){setPublishMessage('');setPublishError({date:selected,message:e.message});}}),2000);
     return()=>{active=false;clearTimeout(timer);};
   },[highlight]);
   async function chooseDate(value){
     if(publishing)return;
     setActiveGroup(null);
-    if(value)setDetailDate(value);
-    setDate(value);setSearch('');setPublishing(true);setError('');setPublishMessage('');
+    setCalendarOpen(false);
+    setDate(value);setPublishing(true);setError('');setPublishMessage('');setPublishError(null);
     try{const result=await api('/api/report-date',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({date:value}),timeoutMs:180000});
-      if(!result.synced&&!result.queued)setError(`Google Sheets date update needs retry: ${result.sync_error}`);
+      if(!result.synced&&!result.queued)setPublishError({date:value,message:result.sync_error});
       else{setHighlight({selected_date:value,publication_state:result.queued?'pending':'synced',highlighted_date:result.highlighted_date});setPublishMessage(result.queued?(value?`Updating Google Sheets for ${dailyDateLabel(value)}…`:'Restoring all orders in Google Sheets…'):(value?`${dailyDateLabel(value)} is highlighted in Daily Status Report and filtered in All Products.`:'Daily Status Report highlight cleared; All Products shows every order.'));}
-    }catch(e){setError(e.message);}finally{setPublishing(false);}
+    }catch(e){setPublishError({date:value,message:e.message});}finally{setPublishing(false);}
   }
   const selectedDay=history.find(day=>day.Date===date)||history[0];
-  const sourceColumns=selectedDay?.columns||[];
-  const columns=[...new Set(['Order Number','Status','Out Time',...sourceColumns])].filter(column=>sourceColumns.includes(column));
-  const rows=(selectedDay?.rows||[]).filter(row=>!search||columns.some(column=>str(row[column]).toLowerCase().includes(search.toLowerCase())));
+  const rows=selectedDay?.rows||[];
   const onTimeOrders=new Set((selectedDay?.sla_rows||[]).filter(row=>row['Free Site']==='On Time').map(orderKey));
   const missingSlaOrders=new Set((selectedDay?.sla_rows||[]).filter(row=>row['Free Site']==='Missing').map(orderKey));
   const groups=[
@@ -576,29 +558,18 @@ function DailyOrders({preview, running, revision}) {
     ['Missing',rows.filter(row=>missingSlaOrders.has(orderKey(row)))],
   ];
   const names=DAILY_SERIES.map(item=>item.name);
-  const statusNames=snapshot?.mode==='excel'?(snapshot.statuses||[]):[];
-  const historyNames=[...names,...statusNames.map(name=>'Status: '+name)];
-  const detailGroups=snapshot?.mode==='excel'?[...groups,
-    ...statusNames.map(name=>[name,rows.filter(row=>(str(row.Status||row['Task Status']).trim()||'(Blank)')===name)])
-  ]:groups;
-  function showGroup(index){
-    setActiveGroup(index);
-    const section=document.getElementById(`daily-orders-group-${index}`);
-    section?.scrollIntoView({behavior:'smooth',block:'start'});
-    section?.focus({preventScroll:true});
-  }
+  const selectedGroup=groups[activeGroup];
+  const publishNoticeId=publishError&&`daily-sheets-${publishError.date}-${publishError.message}`;
   return <section className="daily-orders"><OfflineNotice snapshot={snapshot}/>{snapshot&&!snapshot.offline&&<p className="report-context">{snapshot.source||'Google Sheets'} production · {snapshot.updated_at?`Refreshed ${new Date(snapshot.updated_at).toLocaleString()}`:'Refresh time unavailable'}</p>}
+    {publishError&&<DismissibleNotice key={publishNoticeId} noticeId={publishNoticeId} className="notice warning" role="alert" dismissLabel="Ignore"><strong>Google Sheets date update needs retry</strong>{publishError.message}</DismissibleNotice>}
     {error&&<div className="notice error" role="alert">{error}</div>}{publishMessage&&<p role="status">{publishMessage}</p>}{publishing&&<p role="status">Updating Google Sheets for the selected date…</p>}
     {loading?<LoadingScreen title="Loading daily orders..."/>:<>
-      <div className="section-heading"><h2>Daily production orders</h2><div className="monthly-actions"><a className="secondary" href="/api/export/report?sheet=Daily%20Orders" download>Download Daily Orders</a><button type="button" className="secondary" disabled={publishing||!history.length} onClick={()=>chooseDate('')}>Reset date</button><label>Date<select aria-label="Daily orders date" value={selectedDay?.Date||''} disabled={publishing} onChange={e=>chooseDate(e.target.value)}>{history.map(day=><option key={day.Date} value={day.Date}>{dailyDateLabel(day.Date)}</option>)}</select></label></div></div>
+      <div className="section-heading"><h2>Daily production orders</h2><div className="monthly-actions"><a className="secondary" href="/api/export/report?sheet=Daily%20Orders" download>Download Daily Orders</a><button type="button" className="secondary" disabled={publishing||!history.length} onClick={()=>chooseDate('')}>Reset date</button><button type="button" className="secondary" aria-label="Daily orders date" aria-haspopup="dialog" disabled={publishing||!selectedDay} onClick={()=>setCalendarOpen(true)}><CalendarDays size={16}/>{selectedDay?dailyDateLabel(selectedDay.Date):'Choose date'}</button></div></div>
       {snapshot?.mode!=='excel'&&<p className="report-context">Received uses each order's In-Time or received Date. Completed and pending counts show the current statuses of those received orders. A saved capture can also contain orders received on earlier dates.</p>}
-      <div className="metrics">{names.map((name,index)=><button type="button" className={`metric ${DAILY_TONES[index]}`} key={name} aria-pressed={activeGroup===index} aria-controls={`daily-orders-group-${index}`} disabled={!selectedDay} onClick={()=>showGroup(index)}><span>{name}</span><strong>{selectedDay?.[name]??0}</strong></button>)}</div>
-      <ImportedStatusSummary report={selectedDay}/><p className="report-context">Click a date to open its order table, highlight it in Daily Status Report and filter the Google Sheets All Products tab to that day. Select an Order Number in the dialog to edit its details.</p><DailyOrdersChart history={history} selectedDate={selectedDay?.Date} onSelect={chooseDate} series={snapshot?.mode==='excel'?importedSeries(snapshot):DAILY_SERIES}/>
-      <div className="table-scroll"><FilterableTable><thead><tr>{['Date',...historyNames].map(name=><th key={name}>{name}</th>)}</tr></thead><tbody>{history.map(day=><tr key={day.Date} className={day.Date===selectedDay?.Date?'daily-date-selected':undefined}><td><button className="text-button" aria-pressed={day.Date===selectedDay?.Date} disabled={publishing} onClick={()=>chooseDate(day.Date)}>{dailyDateLabel(day.Date)}</button></td>{historyNames.map(name=><td key={name}>{day[name]??0}</td>)}</tr>)}</tbody></FilterableTable></div>
-      <div className="filter-toolbar"><div className="search-input"><Search size={16}/><input aria-label="Search daily orders" placeholder="Search all columns" value={search} onChange={e=>setSearch(e.target.value)}/></div></div>
-      {selectedDay?detailGroups.map(([name,items],index)=><DataTable key={`${name}-${index}`} id={`daily-orders-group-${index}`} rows={items} columns={columns} filters={{}} openFilter={()=>{}} filterable={false} name={`${name} · ${items.length}`}/>):<div className="table-empty">No daily orders</div>}
+      <div className="metrics">{names.map((name,index)=><button type="button" className={`metric ${DAILY_TONES[index]}`} key={name} aria-haspopup="dialog" disabled={!selectedDay} onClick={()=>setActiveGroup(index)}><span>{name}</span><strong>{selectedDay?.[name]??0}</strong></button>)}</div>
     </>}
-    {detailDate&&<React.Suspense fallback={null}><DateOrdersDialog key={detailDate} kind="daily" date={detailDate} onClose={()=>setDetailDate(null)} onUpdated={()=>setHistoryRefresh(value=>value+1)}/></React.Suspense>}
+    {calendarOpen&&selectedDay&&<DailyOrdersCalendar history={history} selected={selectedDay.Date} onSelect={chooseDate} onClose={()=>setCalendarOpen(false)}/>}
+    {selectedGroup&&selectedDay&&<React.Suspense fallback={null}><DateOrdersDialog key={`${selectedDay.Date}-${activeGroup}`} kind="daily" date={selectedDay.Date} singleGroup={{label:selectedGroup[0],rows:selectedGroup[1]}} onClose={()=>setActiveGroup(null)} onUpdated={()=>setHistoryRefresh(value=>value+1)}/></React.Suspense>}
   </section>;
 }
 
@@ -616,14 +587,10 @@ function monthlyPercentage(report, name) {
   return `${total?((report?.[name]||0)/total*100).toFixed(1):'0.0'}%`;
 }
 
-function MonthlyOrdersChart({history, selectedMonth, onSelect, series=MONTHLY_SERIES}) {
-  return <PeriodOrdersChart history={history} selected={selectedMonth} onSelect={onSelect} period="Month" series={series} title="Monthly Orders by Month" label="Monthly orders bar chart"/>;
-}
-
 const SLA_COLUMNS=['Order Number','Source workbook','Product Group','Product','In Time','Out Time','SLA Expiration','Free Site'];
-const slaRowKey=row=>JSON.stringify([orderKey(row),row.completion_date]);
+const slaRowKey=row=>JSON.stringify([row._record_key||orderKey(row),row.completion_date]);
 
-function SlaOrdersTable({rows, statusFilter, onStatusFilter, onSave, running}) {
+function SlaOrdersTable({rows, statusFilter, onSave, running}) {
   const [search,setSearch]=useState(''), [group,setGroup]=useState(''), [page,setPage]=useState(0);
   const [editing,setEditing]=useState(null), [draft,setDraft]=useState(''), [saving,setSaving]=useState(false);
   const [error,setError]=useState(''), [message,setMessage]=useState('');
@@ -664,7 +631,6 @@ function SlaOrdersTable({rows, statusFilter, onStatusFilter, onSave, running}) {
     {running&&<p className="muted">SLA editing requires a live connection and an idle workspace.</p>}
     <div className="filter-toolbar">
       <div className="search-input"><Search size={16}/><input aria-label="Search SLA orders" placeholder="Search order or product" value={search} disabled={saving} onChange={e=>setSearch(e.target.value)}/></div>
-      <select aria-label="Filter SLA status" value={statusFilter} disabled={saving} onChange={e=>onStatusFilter(e.target.value)}><option value="">All SLA results</option><option value="On Time">SLA On Time</option><option value="Missing">SLA Missed</option></select>
       <select aria-label="Filter SLA product group" value={group} disabled={saving} onChange={e=>setGroup(e.target.value)}><option value="">All products</option><option>Full Title</option><option>Remaining Products</option></select>
       <span className="row-tally">{filtered.length} / {rows.length} orders</span>
     </div>
@@ -688,11 +654,10 @@ function SlaOrdersTable({rows, statusFilter, onStatusFilter, onSave, running}) {
 
 function MonthlyOrders({preview,running,reportMode='tracker'}) {
   const [detail,setDetail]=useState(null);
-  const [history,setHistory]=useState([]), [error,setError]=useState(''), [month,setMonth]=useState(''), [search,setSearch]=useState('');
+  const [history,setHistory]=useState([]), [error,setError]=useState(''), [month,setMonth]=useState('');
   const [loading,setLoading]=useState(true), [snapshot,setSnapshot]=useState(null);
-  const [slaFilter,setSlaFilter]=useState(''), [refreshId,setRefreshId]=useState(0), [saving,setSaving]=useState(false);
+  const [refreshId,setRefreshId]=useState(0), [saving,setSaving]=useState(false);
   const savePending=useRef(false), reportVersion=useRef(0);
-  const deferredSearch=useDeferredValue(search);
   useEffect(()=>{
     let active=true, busy=false;
     setLoading(true);
@@ -714,10 +679,12 @@ function MonthlyOrders({preview,running,reportMode='tracker'}) {
   const saveSla=async(row,status)=>{
     savePending.current=true;setSaving(true);reportVersion.current++;
     try{
-      const order=item=>({order_number:item['Order Number'],completion_date:item.completion_date,expected_status:item['Free Site']});
+      const mode=snapshot?.mode||reportMode;
+      const order=item=>({order_number:item['Order Number'],completion_date:item.completion_date,expected_status:item['Free Site'],
+        ...(mode==='excel'?{record_key:item._record_key}:{})});
       const bulk=Array.isArray(row);
       const result=await api(bulk?'/api/sla-comments/bulk':'/api/sla-comments',{method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify(bulk?{orders:row.map(order),status}:{...order(row),status})});
+        body:JSON.stringify(bulk?{orders:row.map(order),status,mode}:{...order(row),status,mode})});
       reportVersion.current++;setHistory(result.rows);setError('');
       return result.message;
     }finally{savePending.current=false;setSaving(false);}
@@ -726,15 +693,7 @@ function MonthlyOrders({preview,running,reportMode='tracker'}) {
   const currentMonth=new Intl.DateTimeFormat('sv-SE',{timeZone:'Asia/Kolkata',year:'numeric',month:'2-digit'}).format(new Date());
   const selectedMonth=history.find(m=>m.Month===month)||history.find(m=>m.Month===currentMonth)||history[0];
   const columns=selectedMonth?.columns||[];
-  const groups=useMemo(()=>{
-    const query=deferredSearch.toLowerCase(),completed=new Set((selectedMonth?.completed_keys||selectedMonth?.completed_ids||[]).map(value=>normalized(value)));
-    const rows=(selectedMonth?.rows||[]).filter(row=>!query||columns.some(column=>str(row[column]).toLowerCase().includes(query)));
-    if(reportMode==='excel')return [['Month Orders',rows],...(snapshot?.statuses||[]).map(name=>[name,rows.filter(row=>(str(row.Status||row['Task Status']).trim()||'(Blank)')===name)])];
-    return [['Month Orders',rows],['Completed Orders',rows.filter(row=>completed.has(normalized(orderKey(row))))],
-      ['Awaiting for Clarification',rows.filter(row=>orderStatus(row)==='awaiting for clarification')]];
-  },[selectedMonth,deferredSearch,reportMode,snapshot?.statuses]);
   const names=MONTHLY_SERIES.map(series=>series.name);
-  const historyNames=[...names,...(reportMode==='excel'?(snapshot?.statuses||[]).map(name=>'Status: '+name):[])];
   function showMetric(name){
     const rows=selectedMonth?.rows||[];
     const ids=field=>new Set((selectedMonth?.[field]||[]).map(value=>str(value).trim().toLowerCase()));
@@ -745,8 +704,8 @@ function MonthlyOrders({preview,running,reportMode='tracker'}) {
     if(name==='Awaiting for Clarification')matching=rows.filter(row=>orderStatus(row)==='awaiting for clarification');
     if(name.startsWith('SLA ')){
       const result=name==='SLA On Time'?'On Time':'Missing';
-      matching=(selectedMonth?.sla_rows||[]).filter(row=>row['Free Site']===result).map(row=>({...rows.find(item=>orderKey(item)===orderKey(row)),...row}));
-      setSlaFilter(result);
+      setDetail({title:`${name} · ${selectedMonth?.MonthLabel||selectedMonth?.Month}`,slaStatus:result});
+      return;
     }
     setDetail({title:`${name} · ${selectedMonth?.MonthLabel||selectedMonth?.Month}`,rows:matching});
   }
@@ -756,16 +715,15 @@ function MonthlyOrders({preview,running,reportMode='tracker'}) {
     {error&&<div className="notice error">{error}</div>}
     {reportMode==='tracker'&&<MonthlyMaintenance month={selectedMonth?.Month} running={running||saving||snapshot?.offline} onChanged={()=>setRefreshId(value=>value+1)}/>}
     {loading?<LoadingScreen title="Loading monthly orders..."/>:<>
-      <div className="section-heading"><h2>Monthly production orders</h2><div className="monthly-actions"><a className="secondary" href="/api/export/report?sheet=Monthly%20Orders" download>Download Monthly Orders</a><label>Month<select aria-label="Monthly orders date" disabled={saving} value={selectedMonth?.Month||''} onChange={e=>{setMonth(e.target.value);setSearch('');}}>{history.map(m=><option key={m.Month} value={m.Month}>{m.MonthLabel || m.Month}</option>)}</select></label><MonthlyDownload month={selectedMonth?.Month} disabled={running||saving||snapshot?.offline}/></div></div>
+      <div className="section-heading"><h2>Monthly production orders</h2><div className="monthly-actions"><a className="secondary" href="/api/export/report?sheet=Monthly%20Orders" download>Download Monthly Orders</a><label>Month<select aria-label="Monthly orders date" disabled={saving} value={selectedMonth?.Month||''} onChange={e=>setMonth(e.target.value)}>{history.map(m=><option key={m.Month} value={m.Month}>{m.MonthLabel || m.Month}</option>)}</select></label><MonthlyDownload month={selectedMonth?.Month} disabled={running||saving||snapshot?.offline}/></div></div>
       <div className="metrics">{names.slice(0,4).map((name,index)=><button type="button" className={`metric metric-action ${['green','gold','gray','purple'][index]}`} key={name} disabled={!selectedMonth} onClick={()=>showMetric(name)}><span>{name}</span><strong>{selectedMonth?.[name]??(error?'—':0)}</strong><small>{monthlyPercentage(selectedMonth,name)} of {selectedMonth?.['Month Orders']??0} month orders</small></button>)}</div>
       <p className="report-context">SLA percentages use completed orders with an On Time or Missed result. Orders without an SLA result are excluded.</p><div className="section-heading"><h2>SLA results</h2><button className="secondary" disabled={saving} onClick={()=>setRefreshId(value=>value+1)}>Refresh SLA</button></div>
-      <div className="metrics sla-metrics">{names.slice(4).map(name=>{const value=name==='SLA On Time'?'On Time':'Missing';return <button className={`metric sla-metric ${value==='On Time'?'green':'red'}`} key={name} disabled={saving||!selectedMonth} aria-pressed={slaFilter===value} onClick={()=>showMetric(name)}><span>{name}</span><strong>{selectedMonth?.[name]??(error?'—':0)}</strong><small>{monthlyPercentage(selectedMonth,name)} of {(selectedMonth?.['SLA On Time']||0)+(selectedMonth?.['SLA Missed']||0)} SLA results</small></button>;})}</div>
-      <SlaOrdersTable key={selectedMonth?.Month||'empty'} rows={selectedMonth?.sla_rows||[]} statusFilter={slaFilter} onStatusFilter={setSlaFilter} onSave={saveSla} running={running||snapshot?.offline||reportMode==='excel'}/>
-      <ImportedStatusSummary report={selectedMonth}/><MonthlyOrdersChart series={reportMode==='excel'?importedSeries(snapshot):MONTHLY_SERIES} history={history} selectedMonth={selectedMonth?.Month} onSelect={value=>{if(value){setMonth(value);setSearch('');}}}/>
-      <div className="table-scroll"><FilterableTable><thead><tr>{['Month','Previews',...historyNames].map(name=><th key={name}>{name}</th>)}</tr></thead><tbody>{history.map(m=><tr key={m.Month}><td><button className="text-button" onClick={()=>{setMonth(m.Month);setSearch('');}}>{m.MonthLabel || m.Month}</button></td><td>{m.Previews.join(', ')}</td>{historyNames.map(name=><td key={name}>{`${m[name]??0} (${monthlyPercentage(m,name)})`}</td>)}</tr>)}</tbody></FilterableTable></div>
-      <div className="filter-toolbar"><div className="search-input"><Search size={16}/><input aria-label="Search monthly orders" placeholder="Search all columns" value={search} onChange={e=>setSearch(e.target.value)}/></div></div>
-      {selectedMonth?groups.map(([name,items])=><DataTable key={name} rows={items} columns={columns} filters={{}} openFilter={()=>{}} filterable={false} name={`${name} · ${items.length}`}/>):<div className="table-empty">No monthly orders</div>}
-      {detail&&<SideDrawer key={detail.title} {...detail} columns={columns} onClose={()=>setDetail(null)}/>}
+      <div className="metrics sla-metrics">{names.slice(4).map(name=>{const value=name==='SLA On Time'?'On Time':'Missing';return <button className={`metric sla-metric ${value==='On Time'?'green':'red'}`} key={name} disabled={saving||!selectedMonth} aria-haspopup="dialog" onClick={()=>showMetric(name)}><span>{name}</span><strong>{selectedMonth?.[name]??(error?'—':0)}</strong><small>{monthlyPercentage(selectedMonth,name)} of {(selectedMonth?.['SLA On Time']||0)+(selectedMonth?.['SLA Missed']||0)} SLA results</small></button>;})}</div>
+      {detail&&(detail.slaStatus
+        ? <Dialog title={detail.title} onClose={()=>{if(!saving)setDetail(null);}} className="detail-dialog orders-detail-dialog"><div className="dialog-content">
+            <SlaOrdersTable key={detail.title} rows={selectedMonth?.sla_rows||[]} statusFilter={detail.slaStatus} onSave={saveSla} running={running||snapshot?.offline}/>
+          </div></Dialog>
+        : <SideDrawer key={detail.title} {...detail} columns={columns} onClose={()=>setDetail(null)}/>)}
     </>}
   </section>;
 }

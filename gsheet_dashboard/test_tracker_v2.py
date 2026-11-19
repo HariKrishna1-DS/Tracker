@@ -271,6 +271,22 @@ class SheetTransactionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'older preview'):
             sync_trackers(self.frame(1, [{'Order Number': 'B', 'Product': 'Full Title'}]), book=self.book)
 
+    def test_restarted_local_numbers_keep_cloud_history_and_retry_safely(self):
+        store = PreviewStore(self.folder.name)
+        store.restore(2, ['Order Number', 'Product'], [{'Order Number': 'A', 'Product': 'Full Title'}])
+        sync_trackers(self.frame(2, [{'Order Number': 'A', 'Product': 'Full Title'}]), book=self.book)
+        store.delete(2)
+        rows = [{'Order Number': 'B', 'Product': 'Full Title'}]
+        saved = store.save(pd.DataFrame(rows))
+        self.assertEqual(saved['name'], 'preview1')
+        frame = self.frame(saved['id'], rows)
+        sync_trackers(frame, book=self.book)
+        sync_trackers(frame, book=self.book)
+        archive = records(self.book.worksheet('Sheet1').get_all_values())
+        self.assertEqual([(row['Preview'], row['Order Number']) for row in archive],
+                         [('preview2', 'A'), ('preview3', 'B')])
+        self.assertEqual(frame.attrs['pass_report']['preview_name'], 'preview1')
+
     def test_manual_formula_never_written_when_syncing_existing_order(self):
         frame = self.frame(1, [{'Order Number': 'BASE', 'Product': 'Full Title'}])
         sync_trackers(frame, book=self.book)

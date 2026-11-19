@@ -45,6 +45,8 @@ const STANDARD_PROD_STATUSES = [
 ];
 
 const comparisonCategories = ['Future SLA', 'Negative SLA', 'Today SLA'];
+const cancelledStatus = value => /^cancelled$|^canceled$/i.test(String(value).trim());
+const cancelledMatrixPreference = 'tv-tracker-sla-compare-hide-cancelled';
 
 function comparisonSummaryStatus(order) {
   if (order.match_type === 'prod_only') return null;
@@ -173,6 +175,12 @@ export default function SlaCompare({state, reportMode}) {
   const [selectedSlaStatus, setSelectedSlaStatus] = useState(null);
   const [matrixFilter, setMatrixFilter] = useState(null);
   const [showSummaryTable, setShowSummaryTable] = useState(true);
+  const [hideCancelled, setHideCancelled] = useState(() => localStorage.getItem(cancelledMatrixPreference) === 'true');
+  function toggleCancelled(hidden) {
+    localStorage.setItem(cancelledMatrixPreference, String(hidden));
+    setHideCancelled(hidden);
+    setMatrixFilter(null);
+  }
   const [search, setSearch] = useState('');
   const [uploading, setUploading] = useState(false);
   useActivity(loading||uploading, uploading?'Processing production reports…':'Loading comparison…');
@@ -627,7 +635,7 @@ export default function SlaCompare({state, reportMode}) {
         String(order[field] ?? '').toLowerCase().includes(query)));
     }
     if (matrixFilter) {
-      list = list.filter(o => comparisonSummaryStatus(o) !== null && (!matrixFilter.status || comparisonSummaryStatus(o) === matrixFilter.status)
+      list = list.filter(o => comparisonSummaryStatus(o) !== null && (!hideCancelled || !cancelledStatus(comparisonSummaryStatus(o))) && (!matrixFilter.status || comparisonSummaryStatus(o) === matrixFilter.status)
         && (!matrixFilter.category || o.sla_category === matrixFilter.category));
     }
 
@@ -655,7 +663,7 @@ export default function SlaCompare({state, reportMode}) {
     }
 
     return list;
-  }, [data, filterType, selectedSlaStatus, selectedTransition, search, matrixFilter]);
+  }, [data, filterType, selectedSlaStatus, selectedTransition, search, matrixFilter, hideCancelled]);
 
   // 2. Prepare structured records for Excel-like column filtering
   const tableRecords = useMemo(() => {
@@ -699,14 +707,21 @@ export default function SlaCompare({state, reportMode}) {
   const slaSummary = data?.sla_summary || {rows: [], totals: {}};
   const summaryRows = [...slaSummary.rows, ...comparisonEditing.customStatuses
     .filter(status => !slaSummary.rows.some(row => row.Status === status))
-    .map(Status => ({Status, 'Grand Total': 0}))];
-  const visibleComparisonCategories = [...comparisonCategories, ...(slaSummary.totals?.['Unknown SLA']?['Unknown SLA']:[])];
+    .map(Status => ({Status, 'Grand Total': 0}))].filter(row => !hideCancelled || !cancelledStatus(row.Status));
+  const summaryTotals = hideCancelled ? Object.fromEntries(
+    [...comparisonCategories, 'Unknown SLA', 'Grand Total'].map(category =>
+      [category, summaryRows.reduce((sum, row) => sum + (row[category] || 0), 0)])
+  ) : slaSummary.totals;
+  const visibleComparisonCategories = [...comparisonCategories, ...(summaryTotals?.['Unknown SLA']?['Unknown SLA']:[])];
 
   // Helper to open Pop Table modal for matrix cells (based on Production Report status)
   const openMatrixPop = (status, category) => {
     if (!data || !data.orders) return;
     // Include every counted SLA Status order, even when absent from production.
-    const matched = data.orders.filter(o => comparisonSummaryStatus(o) !== null);
+    const matched = data.orders.filter(o => {
+      const status = comparisonSummaryStatus(o);
+      return status !== null && (!hideCancelled || !cancelledStatus(status));
+    });
     let subset = matched;
     if (status && status !== 'Grand Total') {
       subset = subset.filter(o => comparisonSummaryStatus(o) === status);
@@ -952,6 +967,7 @@ export default function SlaCompare({state, reportMode}) {
             <span className="subheading-tag">Grouped by Production Status for the selected SLA Status preview.</span>
           </div>
           <div className="subheading-right inline">
+            {hideCancelled&&<button type="button" className="secondary" onClick={()=>toggleCancelled(false)}>Show Cancelled</button>}
             <button type="button" className="primary compare-add-status" disabled={!comparisonEditing.ready || comparisonEditing.saving} onClick={comparisonEditing.openAddStatus}>
               <Plus size={17} />Add status
             </button>
@@ -965,7 +981,7 @@ export default function SlaCompare({state, reportMode}) {
             )}
             <a
               className="secondary button-link"
-              href="/api/sla-compare/export?table=sla_summary"
+              href={`/api/sla-compare/export?table=sla_summary${hideCancelled?'&exclude_cancelled=1':''}`}
               download
               title="Download SLA Status Summary matrix in Excel"
             >
@@ -1009,7 +1025,7 @@ export default function SlaCompare({state, reportMode}) {
                         >
                           {row.Status}
                         </button>
-                        {comparisonEditing.statusActions(row.Status)}</div>
+                        {comparisonEditing.statusActions(row.Status, cancelledStatus(row.Status)?()=>toggleCancelled(true):undefined)}</div>
                       </th>
                       {[...visibleComparisonCategories, 'Grand Total'].map(category => (
                         <td key={category} className={`col-num ${category === 'Grand Total' ? 'col-grand' : ''}`}>
@@ -1024,7 +1040,7 @@ export default function SlaCompare({state, reportMode}) {
                   );
                 })}
                 {/* Totals Row */}
-                {slaSummary.totals && (
+                {summaryTotals && (
                   <tr className="matrix-total-row">
                     <th scope="row">
                       <button
@@ -1041,7 +1057,7 @@ export default function SlaCompare({state, reportMode}) {
                         <button type="button" className="num-click-btn bold"
                           onClick={() => openMatrixPop(null, category)}
                           title={`Click to open Pop Table for all ${category} orders`}>
-                          {slaSummary.totals[category] || 0}
+                          {summaryTotals[category] || 0}
                         </button>
                       </td>
                     ))}
@@ -1157,7 +1173,7 @@ export default function SlaCompare({state, reportMode}) {
           {filterType === 'sla_only' && <button type="button" className="secondary" onClick={copyNewOrders} disabled={!columnFilterControls.rows.some(record => record._raw.match_type === 'sla_only')} title="Copy rows without headers in production worksheet column order. Paste into the No column.">Copy New Orders for Excel</button>}
           <a
             className="secondary button-link"
-            href={`/api/sla-compare/export?table=orders&filter_type=${encodeURIComponent(isSearching ? 'all' : matrixFilter ? 'summary' : filterType)}${!isSearching && matrixFilter?.status ? `&summary_status=${encodeURIComponent(matrixFilter.status)}` : ''}${!isSearching && matrixFilter?.category ? `&category=${encodeURIComponent(matrixFilter.category)}` : ''}${!isSearching && selectedSlaStatus ? `&sla_status=${encodeURIComponent(selectedSlaStatus)}` : ''}${!isSearching && selectedTransition ? `&from_status=${encodeURIComponent(selectedTransition.from_status)}&to_status=${encodeURIComponent(selectedTransition.to_status)}` : ''}${isSearching ? `&q=${encodeURIComponent(search.trim())}` : ''}`}
+            href={`/api/sla-compare/export?table=orders&filter_type=${encodeURIComponent(isSearching ? 'all' : matrixFilter ? 'summary' : filterType)}${!isSearching && matrixFilter && hideCancelled ? '&exclude_cancelled=1' : ''}${!isSearching && matrixFilter?.status ? `&summary_status=${encodeURIComponent(matrixFilter.status)}` : ''}${!isSearching && matrixFilter?.category ? `&category=${encodeURIComponent(matrixFilter.category)}` : ''}${!isSearching && selectedSlaStatus ? `&sla_status=${encodeURIComponent(selectedSlaStatus)}` : ''}${!isSearching && selectedTransition ? `&from_status=${encodeURIComponent(selectedTransition.from_status)}&to_status=${encodeURIComponent(selectedTransition.to_status)}` : ''}${isSearching ? `&q=${encodeURIComponent(search.trim())}` : ''}`}
             download
             title="Download currently filtered comparison orders to Excel"
           >
@@ -1422,7 +1438,7 @@ export default function SlaCompare({state, reportMode}) {
                 </div>
                 <a
                   className="secondary button-link"
-                  href={`/api/sla-compare/export?table=orders${popModal.scope === 'matrix' ? '&filter_type=summary' : ''}${popModal.summary_status ? `&summary_status=${encodeURIComponent(popModal.summary_status)}` : ''}${popModal.prod_status ? `&prod_status=${encodeURIComponent(popModal.prod_status)}` : ''}${popModal.status ? `&sla_status=${encodeURIComponent(popModal.status)}` : ''}${popModal.category ? `&category=${encodeURIComponent(popModal.category)}` : ''}${popModal.from_status ? `&from_status=${encodeURIComponent(popModal.from_status)}&to_status=${encodeURIComponent(popModal.to_status)}` : ''}`}
+                  href={`/api/sla-compare/export?table=orders${popModal.scope === 'matrix' ? '&filter_type=summary' : ''}${popModal.scope === 'matrix' && hideCancelled ? '&exclude_cancelled=1' : ''}${popModal.summary_status ? `&summary_status=${encodeURIComponent(popModal.summary_status)}` : ''}${popModal.prod_status ? `&prod_status=${encodeURIComponent(popModal.prod_status)}` : ''}${popModal.status ? `&sla_status=${encodeURIComponent(popModal.status)}` : ''}${popModal.category ? `&category=${encodeURIComponent(popModal.category)}` : ''}${popModal.from_status ? `&from_status=${encodeURIComponent(popModal.from_status)}&to_status=${encodeURIComponent(popModal.to_status)}` : ''}`}
                   download
                   title="Download this exact popup table to Excel"
                 >

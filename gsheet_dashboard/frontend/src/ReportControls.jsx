@@ -22,6 +22,10 @@ export default function ReportControls({mode, running, open, setOpen, onChanged,
     setBusy(true);onBusy?.(true);setMessage('');
     try {
       const result=await api(path,{...options,timeoutMs:180000});
+      if(path==='/api/report-import'){
+        setFiles([]);setReplaceAll(false);
+        setOpen(false);
+      }
       const next=await api('/api/report-workspace');setSettings(next);
       await onChanged(next);
       const publication=result.publication||result;

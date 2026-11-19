@@ -113,6 +113,8 @@ function App() {
   const sourceKey=`${dataSourceKey}:${reportRevision}`;
   const sourceEditVersion=useRef(0);
   const [deleteMessage,setDeleteMessage]=useState('');
+  const [deletingPreviews,setDeletingPreviews]=useState(false);
+  const previewHistoryVersion=useRef(0);
   const seen=useRef(null), scheduleLoaded=useRef(false), remainingLoaded=useRef(false), refreshRequest=useRef(null), jobRunning=useRef(false);
   const [compareAttempt,setCompareAttempt]=useState(0);
   const [sheetGroup,setSheetGroup]=useState('all'), [scheduleMessage,setScheduleMessage]=useState('');
@@ -164,8 +166,9 @@ function App() {
     if(refreshRequest.current)return refreshRequest.current;
     refreshRequest.current=(async()=>{
     const editVersion=sourceEditVersion.current;
+    const captureVersion=previewHistoryVersion.current;
     const next=await api('/api/state?light=1');
-    if(editVersion!==sourceEditVersion.current)return;
+    if(editVersion!==sourceEditVersion.current||captureVersion!==previewHistoryVersion.current)return;
     setState(next);setConnectionError('');setReportMode(next.report_workspace?.mode||'tracker');jobRunning.current=next.job.running;
     if(next.schedule&&!scheduleLoaded.current){
       const times = next.schedule.times && next.schedule.times.length ? next.schedule.times : [next.schedule.time || '09:00'];
@@ -378,10 +381,46 @@ function App() {
 
   function choosePrevious(value){setPrevious(value);if(!value)return;const index=state.previews.findIndex(p=>p.id===Number(value));const newer=state.previews[index-1];if(newer)setSelected(newer.id);}
   function chooseLatest(value){const id=Number(value);setSelected(id);const index=state.previews.findIndex(p=>p.id===id);setPrevious(String(state.previews[index+1]?.id||''));}
-  async function deletePreview(event,id){event.stopPropagation();const target=state.previews.find(p=>p.id===id);if(!window.confirm(`Delete ${target?.name||`preview${id}`} and its saved CSV/Excel files? A workspace recovery copy will be saved first. You can restore it in Settings > Local data & recovery.`))return;setError('');setDeleteMessage('');try{const deleted=await api(`/api/previews/${id}`,{method:'DELETE'});if(deleted.recovery_backup)setDeleteMessage(`Capture deleted. Recovery copy: ${deleted.recovery_backup}. Find it in your workspace backups folder; restore it through Settings.`);invalidateProduction();const next=await api('/api/state?light=1');setState(next);seen.current=next.previews[0]?.id??null;const nextSelected=id===selected?(next.previews[0]?.id??null):selected;setSelected(nextSelected);const index=next.previews.findIndex(p=>p.id===nextSelected);setPrevious(String(next.previews[index+1]?.id||''));if(!nextSelected){setPreview(EMPTY);setDiff(null);}refreshProduction();}catch(e){setError(e.message);}}
-  async function batchDeletePreviews(ids){if(!ids||!ids.length)return;if(!window.confirm(`Delete ${ids.length} selected captures and their saved files? A workspace recovery copy will be saved first. You can restore it in Settings > Local data & recovery.`))return;setError('');setDeleteMessage('');try{const deleted=await api('/api/previews/batch-delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ids})});if(deleted.recovery_backup)setDeleteMessage(`${deleted.deleted_count||ids.length} captures deleted. Recovery copy: ${deleted.recovery_backup}.`);invalidateProduction();const next=await api('/api/state?light=1');setState(next);seen.current=next.previews[0]?.id??null;const nextSelected=ids.includes(selected)?(next.previews[0]?.id??null):selected;setSelected(nextSelected);const index=next.previews.findIndex(p=>p.id===nextSelected);setPrevious(String(next.previews[index+1]?.id||''));if(!nextSelected){setPreview(EMPTY);setDiff(null);}refreshProduction();}catch(e){setError(e.message);}}
+  async function applyCaptureHistory(result){
+    previewHistoryVersion.current++;
+    const history=Array.isArray(result.previews)?result:await api('/api/state?light=1');
+    const clearSelection=!history.previews.length;
+    invalidateProduction();
+    seen.current=history.previews[0]?.id??null;
+    setState(current=>({...current,previews:history.previews,pending_sync:history.pending_sync,
+      job:clearSelection?{...current.job,result:null,stage:'Idle'}:current.job}));
+    const nextSelected=!clearSelection&&history.previews.some(preview=>preview.id===selected)?selected:seen.current;
+    const index=history.previews.findIndex(preview=>preview.id===nextSelected);
+    setSelected(nextSelected);
+    setPrevious(String(history.previews[index+1]?.id||''));
+    if(clearSelection||!nextSelected){
+      setPreview(EMPTY);
+      setLoading(false);
+      setDiff(null);
+    }
+    refreshProduction();
+  }
+
+  async function removePreviews(ids, single=false){
+    if(deletingPreviews||!ids.length)return;
+    const prompt=`Delete ${single?`preview${ids[0]}`:`${ids.length} selected captures`} and their saved files? A recovery copy will be saved first.`;
+    if(!window.confirm(prompt))return;
+    setDeletingPreviews(true);
+    setError('');
+    setDeleteMessage('');
+    try{
+      const result=await api(single?`/api/previews/${ids[0]}`:'/api/previews/batch-delete',single?{method:'DELETE'}:
+        {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ids})});
+      await applyCaptureHistory(result);
+      const count=single?1:result.deleted.length;
+      setDeleteMessage(`${count} ${count===1?'capture':'captures'} deleted.${count&&!result.previews.length?' The next capture will be preview1.':''}${result.recovery_backup?` Recovery copy: ${result.recovery_backup}.`:''}`);
+    }catch(e){setError(e.message);}
+    finally{setDeletingPreviews(false);}
+  }
+  function deletePreview(event,id){event.stopPropagation();return removePreviews([id],true);}
+  function batchDeletePreviews(ids){return removePreviews(ids);}
   async function downloadChanges(){try{const response=await fetch('/api/compare',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({previous:Number(previous),latest:selected,keys,ignore,download:true})});if(!response.ok)throw Error((await response.json()).error);saveBlob(await response.blob(),`${diff.previous}-to-${diff.latest}-changes.xlsx`);}catch(e){setError(e.message);}}
-  const running=state.job.running||pending||uploading, result=state.job.result;
+  const running=state.job.running||pending||uploading||deletingPreviews, result=state.job.result;
   return <div className={`workspace ${sidebarCollapsed?'sidebar-collapsed':''}`} data-view={view}>
     <a className="skip-link" href="#workspace-content">Skip to workspace</a>
     <WorkspaceSidebar state={state} selected={selected} view={view} onNavigate={navigate} collapsed={sidebarCollapsed} onToggle={()=>{if(sidebarReady)setSidebarCollapsed(!sidebarCollapsed).catch(()=>{});}} snapshot={liveSheets} busy={running} onRefresh={refreshProduction} refreshing={refreshingProduction} onDelete={deletePreview} onBatchDelete={batchDeletePreviews} onSelect={id=>{setSelected(id);navigate('captures');const index=state.previews.findIndex(p=>p.id===id);setPrevious(String(state.previews[index+1]?.id||''));}}/>

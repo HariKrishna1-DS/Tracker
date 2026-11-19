@@ -676,11 +676,19 @@ def update_order_production_status(result, order_number, new_prod_status, prod_r
 
     return recalculate_summary(result)
 
-def export_comparison_excel(result, table_scope='all', filter_type=None, sla_status=None, prod_status=None, category=None, from_status=None, to_status=None, search=None, summary_status=None):
+def export_comparison_excel(result, table_scope='all', filter_type=None, sla_status=None, prod_status=None, category=None, from_status=None, to_status=None, search=None, summary_status=None, exclude_cancelled=False):
     """Generate clean, styled Excel workbooks for the SLA comparison.
     Supports table_scope in ('all', 'sla_summary', 'movements', 'orders').
     """
-    export_categories = [*COMPARISON_CATEGORIES, *(['Unknown SLA'] if result.get('sla_summary', {}).get('totals', {}).get('Unknown SLA') else [])]
+    def cancelled(status):
+        return str(status).strip().casefold() in ('cancelled', 'canceled')
+
+    sla_sum = result.get('sla_summary', {})
+    if exclude_cancelled:
+        rows = [row for row in sla_sum.get('rows', []) if not cancelled(row['Status'])]
+        sla_sum = {'rows': rows, 'totals': {column: sum(row.get(column, 0) or 0 for row in rows)
+                                          for column in sla_sum.get('totals', {})}}
+    export_categories = [*COMPARISON_CATEGORIES, *(['Unknown SLA'] if sla_sum.get('totals', {}).get('Unknown SLA') else [])]
     export_columns = ['Status', *export_categories, 'Grand Total']
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
     from openpyxl.utils import get_column_letter
@@ -703,13 +711,14 @@ def export_comparison_excel(result, table_scope='all', filter_type=None, sla_sta
     preview_name = result.get('preview_name', '')
     as_of = result.get('as_of', '')
     now_str = datetime.now().strftime('%Y-%m-%d %H:%M')
-    sla_sum = result.get('sla_summary', {})
     transitions = result.get('transitions', [])
     orders = result.get('orders', [])
 
     # Filter orders if scope is orders or if filters are passed
     def filter_order_list(order_list):
         res = list(order_list)
+        if exclude_cancelled:
+            res = [o for o in res if not cancelled(comparison_summary_status(o))]
         if filter_type:
             ft = filter_type.strip().lower()
             if ft in ('status_moved', 'moved'):
